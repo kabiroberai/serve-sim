@@ -71,13 +71,15 @@ export function AppPermissionsTool({
   }
 
   return (
-    <div className="bg-panel border border-white/8 rounded-[10px] px-3 py-2">
+    <div className="bg-panel border border-white/8 rounded-[10px] flex flex-col gap-2.5 px-3 py-2">
       <button
+        type="button"
         onClick={() => setOpen((o) => !o)}
-        className="flex items-center justify-between gap-1.5 bg-transparent border-none text-white/50 p-0 m-0 cursor-pointer w-full text-left leading-none"
+        className="lem-toggle grid [grid-template-columns:auto_1fr_auto] items-center gap-2 bg-transparent border-none text-white/90 py-2.5 px-1 -my-2 -mx-1 cursor-pointer w-[calc(100%+8px)] text-left min-h-[36px] leading-none"
         aria-expanded={open}
       >
-        <span className="text-[11px] font-semibold text-white/50 uppercase tracking-[0.08em] m-0">Permissions</span>
+        <span className="text-[11px] font-semibold text-white/50 uppercase tracking-[0.08em] leading-none inline-flex items-center">Permissions</span>
+        <span />
         <Chevron open={open} />
       </button>
 

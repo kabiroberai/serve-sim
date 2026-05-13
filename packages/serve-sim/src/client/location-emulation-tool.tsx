@@ -87,7 +87,7 @@ export function LocationEmulationTool({
   udid: string;
   exec: ExecFn;
 }) {
-  const [open, setOpen] = useState(true);
+  const [open, setOpen] = useState(false);
   const [trailId, setTrailId] = useState<string>(DEFAULT_TRAILS[0]!.id);
   const [mode, setMode] = useState<TrailMode>(DEFAULT_TRAILS[0]!.mode);
   const [multiplier, setMultiplier] = useState<SpeedMultiplier>(1);
