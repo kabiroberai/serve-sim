@@ -54,6 +54,7 @@ import {
   GRID_PANEL_WIDTH,
   PANEL_WIDTH,
 } from "./utils/panel-widths";
+import { proxyPreviewConfigForBrowser } from "./utils/preview-config";
 import { simEndpoint } from "./utils/sim-endpoint";
 import {
   SIMULATOR_RESIZE_DRAG_TRANSITION,
@@ -86,7 +87,9 @@ function previewConfigKey(config: PreviewConfig | null): string {
 }
 
 function App() {
-  const [config, setConfig] = useState<PreviewConfig | null>(() => window.__SIM_PREVIEW__ ?? null);
+  const [config, setConfig] = useState<PreviewConfig | null>(() =>
+    proxyPreviewConfigForBrowser(window.__SIM_PREVIEW__, window.location)
+  );
   const [streaming, setStreaming] = useState(false);
   const [devices, setDevices] = useState<SimDevice[]>([]);
   const [devicesLoading, setDevicesLoading] = useState(false);
@@ -120,6 +123,7 @@ function App() {
 
     const applyConfig = (next: PreviewConfig | null) => {
       setConfig((prev) => {
+        next = proxyPreviewConfigForBrowser(next, window.location);
         if (previewConfigKey(prev) === previewConfigKey(next)) return prev;
         if (next) window.__SIM_PREVIEW__ = next;
         else delete window.__SIM_PREVIEW__;
@@ -363,6 +367,7 @@ function AppWithConfig({
 
   // Touch/button relay via direct WebSocket
   const wsRef = useRef<WebSocket | null>(null);
+  const inputPostChainRef = useRef<Promise<void>>(Promise.resolve());
   useEffect(() => {
     let stopped = false;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -419,14 +424,28 @@ function AppWithConfig({
   }, [config.wsUrl]);
 
   const sendWs = useCallback((tag: number, payload: object) => {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
     const json = new TextEncoder().encode(JSON.stringify(payload));
     const msg = new Uint8Array(1 + json.length);
     msg[0] = tag;
     msg.set(json, 1);
-    ws.send(msg);
-  }, []);
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(msg);
+      return;
+    }
+    const inputEndpoint = config.inputEndpoint;
+    if (!inputEndpoint) return;
+    const body = msg.slice();
+    inputPostChainRef.current = inputPostChainRef.current
+      .catch(() => {})
+      .then(() =>
+        fetch(inputEndpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/octet-stream" },
+          body,
+        }).then(() => {})
+      );
+  }, [config.inputEndpoint]);
 
   const onStreamTouch = useCallback((data: any) => sendWs(0x03, data), [sendWs]);
   const onStreamMultiTouch = useCallback((data: any) => sendWs(0x05, data), [sendWs]);
@@ -779,6 +798,7 @@ function AppWithConfig({
         >
           <SimulatorView
             url={config.url}
+            wsUrl={config.wsUrl}
             style={{
               width: "100%",
               height: "100%",

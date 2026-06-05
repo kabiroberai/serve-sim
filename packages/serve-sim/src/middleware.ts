@@ -3,14 +3,19 @@ import { execSync, spawn, exec, execFile, type ChildProcess, type ExecException 
 import { tmpdir } from "os";
 import { join } from "path";
 import { createServer as createNetServer } from "net";
-import { randomBytes, timingSafeEqual } from "crypto";
-import type { IncomingMessage, ServerResponse } from "http";
+import { createHash, randomBytes, timingSafeEqual } from "crypto";
+import { request as httpRequest, type IncomingMessage, type ServerResponse } from "http";
+import type { Socket } from "net";
 import { createAxStreamerCache } from "./ax";
 import { debugMw } from "./debug";
 
 type SimReq = IncomingMessage;
 type SimRes = ServerResponse;
 type SimNext = (err?: unknown) => void;
+export type SimMiddleware = {
+  (req: SimReq, res: SimRes, next?: SimNext): void;
+  handleUpgrade(req: SimReq, socket: Socket, head: Buffer): void;
+};
 
 // Injected at build time as a base64-encoded string via `define`
 declare const __PREVIEW_HTML_B64__: string;
@@ -86,6 +91,10 @@ export interface ServeSimState {
 }
 
 const axStreamerCache = createAxStreamerCache();
+const helperInputSockets = new Map<string, {
+  ws: WebSocket;
+  ready: Promise<void>;
+}>();
 
 // Hard cap on the SSE line-assembly buffer for child-process stdout.
 // A malformed log entry without a newline can't grow this beyond 1 MB;
@@ -116,6 +125,10 @@ const NON_UI_BUNDLE_RE = /(WidgetRenderer|ExtensionHost|\.extension(\.|$)|Servic
 
 function isUserFacingBundle(bundleId: string): boolean {
   return !NON_UI_BUNDLE_RE.test(bundleId);
+}
+
+function isSimulatorUdid(value: string): boolean {
+  return /^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$/i.test(value);
 }
 
 export function parseForegroundAppLogMessage(message: string): { bundleId: string; pid: number } | null {
@@ -228,7 +241,7 @@ function readServeSimStates(): ServeSimState[] {
       // would accept connections yet never produce frames, leaving the
       // preview stuck on "Connecting...". Recycle the stale state so the
       // caller can spawn a fresh helper bound to whatever is booted.
-      if (booted && !booted.has(state.device)) {
+      if (booted && isSimulatorUdid(state.device) && !booted.has(state.device)) {
         debugMw(
           "recycling stale helper pid=%d (device %s no longer booted)",
           state.pid,
@@ -260,41 +273,330 @@ function queryDevice(rawUrl: string): string | null {
   return new URLSearchParams(rawUrl.slice(qIndex + 1)).get("device");
 }
 
+function hostForRequest(req: SimReq): string | undefined {
+  const host = req.headers?.host;
+  if (host) return host;
+  const port = req.socket.localPort;
+  return port ? `localhost:${port}` : undefined;
+}
+
 function endpoint(base: string, path: string, device: string): string {
   const value = `${base}${path}`;
   return `${value}?device=${encodeURIComponent(device)}`;
 }
 
 /**
- * Rewrite the helper URLs in a state so they point at the hostname the request
- * came in on. The helper binds on `*:<port>`, so once the host portion matches
- * the dev-server origin, a remote viewer (LAN, or tunnel exposing the helper
- * port under the same hostname) can reach the stream. Loopback callers get
- * the state untouched.
+ * Rewrite the helper URLs in a state so browser clients reach the helper via
+ * the preview server's same-origin `/helper` proxy. The CLI and state files
+ * keep using the helper's loopback port for direct local control, but the web
+ * UI no longer requires exposing that separate port to LAN/tunnel users.
  */
 export function rewriteStateForRequestHost(
   state: ServeSimState,
   hostHeader: string | undefined,
+  base = "",
 ): ServeSimState {
-  if (!hostHeader) return state;
-  let hostname: string;
-  try {
-    hostname = new URL(`http://${hostHeader}`).hostname;
-  } catch {
+  if (!hostHeader) {
     return state;
   }
-  // `URL.hostname` keeps brackets around IPv6 literals, so the IPv6 loopback
-  // comparison is against the bracketed form rather than `::1`.
-  if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]") {
-    return state;
-  }
-  const rewrite = (s: string) => s.replace("127.0.0.1", hostname);
+  const normalizedBase = base === "/" ? "" : base.replace(/\/+$/, "");
+  const helperBase = `${normalizedBase}/helper`;
+  const devicePath = `${helperBase}/${encodeURIComponent(state.device)}`;
+  const origin = `http://${hostHeader}`;
+  const wsOrigin = `ws://${hostHeader}`;
   return {
     ...state,
-    url: rewrite(state.url),
-    streamUrl: rewrite(state.streamUrl),
-    wsUrl: rewrite(state.wsUrl),
+    url: `${origin}${devicePath}`,
+    streamUrl: `${origin}${devicePath}/stream.mjpeg`,
+    wsUrl: `${wsOrigin}${devicePath}/ws`,
   };
+}
+
+function helperProxyPrefix(base: string): string {
+  return `${base === "/" ? "" : base}/helper`;
+}
+
+function helperProxyTarget(rawUrl: string, prefix: string): { device: string | null; upstreamPath: string } | null {
+  const parsed = new URL(rawUrl, "http://serve-sim.local");
+  if (parsed.pathname !== prefix && !parsed.pathname.startsWith(`${prefix}/`)) {
+    return null;
+  }
+  const rawSuffix = parsed.pathname.slice(prefix.length);
+  const segments = rawSuffix.replace(/^\/+/, "").split("/").filter(Boolean);
+  const directHelperEndpoints = new Set([
+    "ax",
+    "config",
+    "foreground",
+    "health",
+    "stream.avcc",
+    "stream.mjpeg",
+    "ws",
+  ]);
+  let device = parsed.searchParams.get("device");
+  let upstreamSegments = segments;
+  if (segments[0] && !directHelperEndpoints.has(segments[0])) {
+    device = decodeURIComponent(segments[0]);
+    upstreamSegments = segments.slice(1);
+  }
+  const suffix = upstreamSegments.length > 0 ? `/${upstreamSegments.join("/")}` : "/";
+  parsed.searchParams.delete("device");
+  return { device, upstreamPath: `${suffix}${parsed.search}` };
+}
+
+function proxyHelperHttp(req: SimReq, res: SimRes, state: ServeSimState, upstreamPath: string): void {
+  const proxyReq = httpRequest(
+    {
+      host: "127.0.0.1",
+      port: state.port,
+      method: req.method,
+      path: upstreamPath,
+      headers: {
+        ...req.headers,
+        host: `127.0.0.1:${state.port}`,
+      },
+    },
+    (proxyRes) => {
+      res.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers);
+      proxyRes.pipe(res);
+    },
+  );
+  proxyReq.on("error", (err) => {
+    if (res.headersSent) {
+      res.destroy(err);
+      return;
+    }
+    res.writeHead(502, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end(err instanceof Error ? err.message : "Helper proxy failed");
+  });
+  req.pipe(proxyReq);
+}
+
+function helperInputSocket(state: ServeSimState): { ws: WebSocket; ready: Promise<void> } {
+  const existing = helperInputSockets.get(state.device);
+  if (
+    existing &&
+    (existing.ws.readyState === WebSocket.OPEN || existing.ws.readyState === WebSocket.CONNECTING)
+  ) {
+    return existing;
+  }
+
+  const ws = new WebSocket(state.wsUrl);
+  ws.binaryType = "arraybuffer";
+  const ready = new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("Timed out connecting to helper WebSocket")), 3_000);
+    ws.onopen = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    ws.onerror = () => {
+      clearTimeout(timer);
+      reject(new Error("Failed to connect to helper WebSocket"));
+    };
+  });
+  ws.onclose = () => {
+    if (helperInputSockets.get(state.device)?.ws === ws) {
+      helperInputSockets.delete(state.device);
+    }
+  };
+  const entry = { ws, ready };
+  helperInputSockets.set(state.device, entry);
+  return entry;
+}
+
+function postHelperInput(req: SimReq, res: SimRes, state: ServeSimState): void {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  let aborted = false;
+  req.on("data", (chunk: Buffer | string) => {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += buffer.length;
+    if (size > 64 * 1024) {
+      aborted = true;
+      res.writeHead(413, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("Payload Too Large");
+      req.destroy();
+      return;
+    }
+    chunks.push(buffer);
+  });
+  req.on("end", () => {
+    if (aborted) return;
+    (async () => {
+      const payload = Buffer.concat(chunks);
+      if (payload.length === 0) {
+        res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+        res.end("Missing input payload");
+        return;
+      }
+      const entry = helperInputSocket(state);
+      await entry.ready;
+      if (entry.ws.readyState !== WebSocket.OPEN) {
+        throw new Error("Helper WebSocket is not open");
+      }
+      entry.ws.send(payload);
+      res.writeHead(204);
+      res.end();
+    })().catch((err) => {
+      if (helperInputSockets.get(state.device)?.ws.readyState !== WebSocket.OPEN) {
+        helperInputSockets.delete(state.device);
+      }
+      res.writeHead(502, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end(err instanceof Error ? err.message : "Failed to forward input");
+    });
+  });
+}
+
+const WS_ACCEPT_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+function websocketFrame(opcode: number, payload: Buffer): Buffer {
+  const length = payload.length;
+  let header: Buffer;
+  if (length < 126) {
+    header = Buffer.from([0x80 | opcode, length]);
+  } else if (length <= 0xffff) {
+    header = Buffer.alloc(4);
+    header[0] = 0x80 | opcode;
+    header[1] = 126;
+    header.writeUInt16BE(length, 2);
+  } else {
+    header = Buffer.alloc(10);
+    header[0] = 0x80 | opcode;
+    header[1] = 127;
+    header.writeBigUInt64BE(BigInt(length), 2);
+  }
+  return Buffer.concat([header, payload]);
+}
+
+type ParsedWebSocketFrame = {
+  opcode: number;
+  payload: Buffer;
+  consumed: number;
+};
+
+function parseWebSocketFrame(buffer: Buffer): ParsedWebSocketFrame | null {
+  if (buffer.length < 2) return null;
+  const opcode = buffer[0]! & 0x0f;
+  const masked = (buffer[1]! & 0x80) !== 0;
+  let length = buffer[1]! & 0x7f;
+  let offset = 2;
+  if (length === 126) {
+    if (buffer.length < offset + 2) return null;
+    length = buffer.readUInt16BE(offset);
+    offset += 2;
+  } else if (length === 127) {
+    if (buffer.length < offset + 8) return null;
+    const bigLength = buffer.readBigUInt64BE(offset);
+    if (bigLength > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new Error("WebSocket frame too large");
+    }
+    length = Number(bigLength);
+    offset += 8;
+  }
+  const maskOffset = offset;
+  if (masked) offset += 4;
+  if (buffer.length < offset + length) return null;
+  const payload = Buffer.from(buffer.subarray(offset, offset + length));
+  if (masked) {
+    const mask = buffer.subarray(maskOffset, maskOffset + 4);
+    for (let i = 0; i < payload.length; i++) {
+      payload[i] = payload[i]! ^ mask[i % 4]!;
+    }
+  }
+  return { opcode, payload, consumed: offset + length };
+}
+
+function sendBrowserFrame(socket: Socket, opcode: number, payload = Buffer.alloc(0)): void {
+  if (socket.destroyed || !socket.writable) return;
+  socket.write(websocketFrame(opcode, payload));
+}
+
+function bridgeHelperWebSocket(req: SimReq, socket: Socket, head: Buffer, state: ServeSimState): void {
+  const key = req.headers["sec-websocket-key"];
+  if (typeof key !== "string") {
+    socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
+    return;
+  }
+  const accept = createHash("sha1")
+    .update(key + WS_ACCEPT_GUID)
+    .digest("base64");
+  socket.write(
+    "HTTP/1.1 101 Switching Protocols\r\n" +
+    "Upgrade: websocket\r\n" +
+    "Connection: Upgrade\r\n" +
+    `Sec-WebSocket-Accept: ${accept}\r\n` +
+    "\r\n",
+  );
+  socket.resume();
+
+  const upstream = new WebSocket(state.wsUrl);
+  upstream.binaryType = "arraybuffer";
+  let upstreamOpen = false;
+  let closed = false;
+  let pendingToHelper: Buffer[] = [];
+  let buffered = Buffer.from(head);
+
+  const closeBoth = () => {
+    if (closed) return;
+    closed = true;
+    try { upstream.close(); } catch {}
+    try { socket.end(websocketFrame(0x8, Buffer.alloc(0))); } catch {}
+    try { socket.destroy(); } catch {}
+  };
+
+  const sendToHelper = (payload: Buffer) => {
+    if (upstreamOpen && upstream.readyState === WebSocket.OPEN) {
+      upstream.send(payload);
+      return;
+    }
+    pendingToHelper.push(Buffer.from(payload));
+  };
+
+  const drainFrames = () => {
+    try {
+      while (buffered.length > 0) {
+        const frame = parseWebSocketFrame(buffered);
+        if (!frame) break;
+        buffered = buffered.subarray(frame.consumed);
+        if (frame.opcode === 0x8) {
+          sendBrowserFrame(socket, 0x8, frame.payload);
+          closeBoth();
+          return;
+        }
+        if (frame.opcode === 0x9) {
+          sendBrowserFrame(socket, 0xA, frame.payload);
+          continue;
+        }
+        if (frame.opcode === 0x1 || frame.opcode === 0x2) {
+          sendToHelper(frame.payload);
+        }
+      }
+    } catch {
+      closeBoth();
+    }
+  };
+
+  upstream.onopen = () => {
+    upstreamOpen = true;
+    for (const payload of pendingToHelper) upstream.send(payload);
+    pendingToHelper = [];
+  };
+  upstream.onmessage = (event) => {
+    const data = event.data;
+    const payload = typeof data === "string"
+      ? Buffer.from(data)
+      : Buffer.from(data as ArrayBuffer);
+    sendBrowserFrame(socket, typeof data === "string" ? 0x1 : 0x2, payload);
+  };
+  upstream.onerror = closeBoth;
+  upstream.onclose = closeBoth;
+
+  socket.on("data", (chunk) => {
+    buffered = Buffer.concat([buffered, chunk]);
+    drainFrames();
+  });
+  socket.on("error", closeBoth);
+  socket.on("close", closeBoth);
+  drainFrames();
 }
 
 export function previewConfigForState(
@@ -308,6 +610,7 @@ export function previewConfigForState(
   appStateEndpoint: string;
   axEndpoint: string;
   devtoolsEndpoint: string;
+  inputEndpoint: string;
   serveSimBin: string;
   gridApiEndpoint: string;
   gridStartEndpoint: string;
@@ -324,6 +627,7 @@ export function previewConfigForState(
     appStateEndpoint: endpoint(base, "/appstate", state.device),
     axEndpoint: endpoint(base, "/ax", state.device),
     devtoolsEndpoint: endpoint(base, "/devtools", state.device),
+    inputEndpoint: `${base === "/" ? "" : base}/helper/${encodeURIComponent(state.device)}/input`,
     serveSimBin,
     gridApiEndpoint: gridApiBase,
     gridStartEndpoint: gridApiBase + "/start",
@@ -699,19 +1003,37 @@ function isJsonContentType(value: string | undefined): boolean {
  *   GET  {basePath}/logs    — SSE stream of simctl logs
  *   GET  {basePath}/ax      — SSE stream of normalized accessibility snapshots
  */
-export function simMiddleware(options?: SimMiddlewareOptions) {
+export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
   const base = (options?.basePath ?? "/.sim").replace(/\/+$/, "");
+  const helperPrefix = helperProxyPrefix(base);
   // Per-process random token. Anyone who can read the preview HTML same-origin
   // can call /exec; cross-origin pages and LAN clients cannot, because they
   // can't read this value (it's only injected into the preview page's config).
   const execToken = options?.execToken ?? randomBytes(32).toString("base64url");
 
-  return (req: SimReq, res: SimRes, next?: SimNext) => {
+  const middleware = ((req: SimReq, res: SimRes, next?: SimNext) => {
     const rawUrl: string = req.url ?? "";
     const qIndex = rawUrl.indexOf("?");
     const url = qIndex === -1 ? rawUrl : rawUrl.slice(0, qIndex);
     const selectedDevice = queryDevice(rawUrl) ?? options?.device ?? null;
     const devtoolsFrontendBase = base === "/" ? "/devtools-frontend" : `${base}/devtools-frontend`;
+
+    const helperTarget = helperProxyTarget(rawUrl, helperPrefix);
+    if (helperTarget) {
+      const states = readServeSimStates();
+      const state = selectServeSimState(states, helperTarget.device ?? selectedDevice);
+      if (!state) {
+        res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+        res.end("No serve-sim device");
+        return;
+      }
+      if (helperTarget.upstreamPath === "/input" && req.method === "POST") {
+        postHelperInput(req, res, state);
+        return;
+      }
+      proxyHelperHttp(req, res, state, helperTarget.upstreamPath);
+      return;
+    }
 
     // Same-origin proxy for Chrome DevTools frontend assets. Loading the
     // appspot-hosted frontend directly works as a top-level tab, but is flaky
@@ -765,7 +1087,7 @@ export function simMiddleware(options?: SimMiddlewareOptions) {
       }
 
       if (state) {
-        const remoteState = rewriteStateForRequestHost(state, req.headers?.host);
+        const remoteState = rewriteStateForRequestHost(state, hostForRequest(req), base);
         const config = JSON.stringify(previewConfigForState(remoteState, base, serveSimBinPath(), execToken));
         const configScript = `<script>window.__SIM_PREVIEW__=${config}</script>`;
         html = html.replace("<!--__SIM_PREVIEW_CONFIG__-->", configScript);
@@ -796,7 +1118,7 @@ export function simMiddleware(options?: SimMiddlewareOptions) {
       const sims = listAllSimulators();
       const devices = sims.map((d) => {
         const helper = helperByUdid.get(d.udid);
-        const remoteHelper = helper ? rewriteStateForRequestHost(helper, req.headers?.host) : null;
+        const remoteHelper = helper ? rewriteStateForRequestHost(helper, hostForRequest(req), base) : null;
         return {
           device: d.udid,
           name: d.name,
@@ -1054,7 +1376,7 @@ export function simMiddleware(options?: SimMiddlewareOptions) {
         "Content-Type": "application/json",
         "Cache-Control": "no-store",
       });
-      const remoteState = state ? rewriteStateForRequestHost(state, req.headers?.host) : null;
+      const remoteState = state ? rewriteStateForRequestHost(state, hostForRequest(req), base) : null;
       res.end(JSON.stringify(remoteState ? previewConfigForState(remoteState, base, serveSimBinPath(), execToken) : null));
       return;
     }
@@ -1067,7 +1389,7 @@ export function simMiddleware(options?: SimMiddlewareOptions) {
       const computeConfig = (): string => {
         const states = readServeSimStates();
         const state = selectServeSimState(states, selectedDevice);
-        const remoteState = state ? rewriteStateForRequestHost(state, req.headers?.host) : null;
+        const remoteState = state ? rewriteStateForRequestHost(state, hostForRequest(req), base) : null;
         return JSON.stringify(
           remoteState ? previewConfigForState(remoteState, base, serveSimBinPath(), execToken) : null,
         );
@@ -1389,5 +1711,26 @@ export function simMiddleware(options?: SimMiddlewareOptions) {
 
     // Not ours — pass through
     if (next) next();
+  }) as SimMiddleware;
+  middleware.handleUpgrade = (req: SimReq, socket: Socket, head: Buffer) => {
+    const rawUrl = req.url ?? "";
+    const selectedDevice = queryDevice(rawUrl) ?? options?.device ?? null;
+    const helperTarget = helperProxyTarget(rawUrl, helperPrefix);
+    if (!helperTarget) {
+      socket.destroy();
+      return;
+    }
+    const states = readServeSimStates();
+    const state = selectServeSimState(states, helperTarget.device ?? selectedDevice);
+    if (!state) {
+      socket.end("HTTP/1.1 404 Not Found\r\n\r\n");
+      return;
+    }
+    if (helperTarget.upstreamPath === "/ws") {
+      bridgeHelperWebSocket(req, socket, head, state);
+      return;
+    }
+    socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
   };
+  return middleware;
 }

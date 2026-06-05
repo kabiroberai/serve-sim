@@ -12,6 +12,7 @@ declare global {
       axEndpoint?: string;
       appStateEndpoint?: string;
       devtoolsEndpoint?: string;
+      inputEndpoint?: string;
       gridApiEndpoint?: string;
       gridStartEndpoint?: string;
       gridShutdownEndpoint?: string;
