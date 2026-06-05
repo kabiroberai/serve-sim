@@ -302,6 +302,7 @@ export function previewConfigForState(
   base: string,
   serveSimBin: string,
   execToken: string,
+  disableAvcc = false,
 ): ServeSimState & {
   basePath: string;
   logsEndpoint: string;
@@ -315,6 +316,7 @@ export function previewConfigForState(
   gridMemoryEndpoint: string;
   previewEndpoint: string;
   execToken: string;
+  disableAvcc: boolean;
 } {
   const gridApiBase = (base === "" ? "" : base) + "/grid/api";
   return {
@@ -331,6 +333,7 @@ export function previewConfigForState(
     gridMemoryEndpoint: gridApiBase + "/memory",
     previewEndpoint: base === "" ? "/" : base,
     execToken,
+    disableAvcc,
   };
 }
 
@@ -674,6 +677,8 @@ export interface SimMiddlewareOptions {
    * cross-origin pages cannot read it.
    */
   execToken?: string;
+  /** Force the preview UI to use MJPEG instead of AVCC/H.264. */
+  disableAvcc?: boolean;
 }
 
 function safeEqualString(a: string, b: string): boolean {
@@ -766,7 +771,7 @@ export function simMiddleware(options?: SimMiddlewareOptions) {
 
       if (state) {
         const remoteState = rewriteStateForRequestHost(state, req.headers?.host);
-        const config = JSON.stringify(previewConfigForState(remoteState, base, serveSimBinPath(), execToken));
+        const config = JSON.stringify(previewConfigForState(remoteState, base, serveSimBinPath(), execToken, !!options?.disableAvcc));
         const configScript = `<script>window.__SIM_PREVIEW__=${config}</script>`;
         html = html.replace("<!--__SIM_PREVIEW_CONFIG__-->", configScript);
       }
@@ -1055,7 +1060,7 @@ export function simMiddleware(options?: SimMiddlewareOptions) {
         "Cache-Control": "no-store",
       });
       const remoteState = state ? rewriteStateForRequestHost(state, req.headers?.host) : null;
-      res.end(JSON.stringify(remoteState ? previewConfigForState(remoteState, base, serveSimBinPath(), execToken) : null));
+      res.end(JSON.stringify(remoteState ? previewConfigForState(remoteState, base, serveSimBinPath(), execToken, !!options?.disableAvcc) : null));
       return;
     }
 
@@ -1069,7 +1074,7 @@ export function simMiddleware(options?: SimMiddlewareOptions) {
         const state = selectServeSimState(states, selectedDevice);
         const remoteState = state ? rewriteStateForRequestHost(state, req.headers?.host) : null;
         return JSON.stringify(
-          remoteState ? previewConfigForState(remoteState, base, serveSimBinPath(), execToken) : null,
+          remoteState ? previewConfigForState(remoteState, base, serveSimBinPath(), execToken, !!options?.disableAvcc) : null,
         );
       };
 

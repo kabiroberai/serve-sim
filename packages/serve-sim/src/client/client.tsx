@@ -325,7 +325,7 @@ function AppWithConfig({
     avccFallbackReducer,
     initialAvccFallback,
   );
-  const useAvccVideo = avcc.supported && !avccFallback.fellBack;
+  const useAvccVideo = !config.disableAvcc && avcc.supported && !avccFallback.fellBack;
   const mjpeg = useMjpegStream(useAvccVideo ? null : config.streamUrl);
 
   // Re-arm AVCC whenever the target stream changes (device switch / reconnect).

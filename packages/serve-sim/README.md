@@ -66,6 +66,7 @@ Options:
   -d, --detach        Spawn helper and exit (daemon mode)
   -q, --quiet         JSON-only output
       --no-preview    Skip the web UI; stream in foreground only
+      --no-avcc       Disable AVCC/H.264 video in the preview UI; force MJPEG
       --list [device] List running streams
       --kill [device] Kill running stream(s)
 
