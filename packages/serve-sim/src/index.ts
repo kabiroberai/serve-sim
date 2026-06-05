@@ -1757,7 +1757,13 @@ Examples:
 
 // ─── Serve preview ───
 
-async function serve(servePort: number, devices: string[], portExplicit: boolean, host: string) {
+async function serve(
+  servePort: number,
+  devices: string[],
+  portExplicit: boolean,
+  host: string,
+  disableAvcc: boolean,
+) {
   let targetDevice: string | undefined;
 
   if (devices.length > 0) {
@@ -1776,7 +1782,7 @@ async function serve(servePort: number, devices: string[], portExplicit: boolean
   }
 
   const { simMiddleware } = await import("./middleware");
-  const middleware = simMiddleware({ basePath: "/", device: targetDevice });
+  const middleware = simMiddleware({ basePath: "/", device: targetDevice, disableAvcc });
 
   // Try requested port; if busy and the user didn't pin it, scan forward.
   const maxScan = portExplicit ? 1 : 50;
@@ -1853,6 +1859,7 @@ program
   .option("--detach", "Spawn helper and exit (daemon mode)")
   .option("-q, --quiet", "Suppress human-readable output, JSON only")
   .option("--no-preview", "Skip the web preview server; stream in foreground only")
+  .option("--no-avcc", "Disable AVCC/H.264 video in the preview UI; force MJPEG")
   .option("-l, --list [device]", "List running streams")
   .option("-k, --kill [device]", "Kill running stream(s)")
   .addHelpText(
@@ -1883,7 +1890,7 @@ Examples:
     } else if (opts.preview === false) {
       await follow(devices, startPort ?? 3100, !!opts.quiet);
     } else {
-      await serve(startPort ?? 3200, devices, startPort !== undefined, opts.host);
+      await serve(startPort ?? 3200, devices, startPort !== undefined, opts.host, opts.avcc === false);
     }
   });
 

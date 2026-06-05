@@ -58,7 +58,14 @@ describe("previewConfigForState", () => {
       gridMemoryEndpoint: "/preview/grid/api/memory",
       previewEndpoint: "/preview",
       execToken: "token-xyz",
+      disableAvcc: false,
     });
+  });
+
+  test("can disable AVCC in the client config", () => {
+    expect(
+      previewConfigForState(states[0]!, "/preview", "/bin/serve-sim", "token-xyz", true).disableAvcc,
+    ).toBe(true);
   });
 });
 

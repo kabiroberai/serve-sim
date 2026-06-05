@@ -23,6 +23,8 @@ declare global {
       serveSimBin?: string;
       /** Bearer token required by the /exec shell-exec route. */
       execToken?: string;
+      /** Force MJPEG instead of AVCC/H.264. */
+      disableAvcc?: boolean;
     };
   }
 }
