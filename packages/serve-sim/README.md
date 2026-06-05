@@ -205,9 +205,10 @@ app.use(simMiddleware({ basePath: "/.sim" }));
 // → state JSON  at /.sim/api
 // → SSE logs    at /.sim/logs
 // → helper proxy at /.sim/helper/<device>
+// → DevTools proxy at /.sim/devtools
 ```
 
-The middleware reads the helper's state from `$TMPDIR/serve-sim/` and serves the browser-facing stream + input endpoints through same-origin `/helper/<device>` URLs. For standalone `serve-sim`, that means remote users only need access to the preview port (default `3200`); the per-device helper port can stay local to the host.
+The middleware reads the helper's state from `$TMPDIR/serve-sim/` and serves the browser-facing stream, input, and WebKit DevTools endpoints through same-origin `/helper/<device>` and `/devtools` URLs. For standalone `serve-sim`, that means remote users only need access to the preview port (default `3200`); the per-device helper port and inspect-webkit bridge can stay local to the host.
 
 ## How it works
 

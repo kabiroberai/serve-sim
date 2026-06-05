@@ -38,7 +38,7 @@ type WebKitBridgeTarget = {
   inUseByOtherInspector?: boolean;
 };
 
-type WebKitBridge = {
+export type WebKitBridge = {
   port: number;
   cdpUrl: string;
   listTargets(): Promise<WebKitBridgeTarget[]>;
@@ -316,6 +316,19 @@ function helperProxyPrefix(base: string): string {
   return `${base === "/" ? "" : base}/helper`;
 }
 
+function devtoolsProxyPrefix(base: string): string {
+  return `${base === "/" ? "" : base}/devtools`;
+}
+
+function devtoolsProxyTarget(rawUrl: string, prefix: string): { upstreamPath: string } | null {
+  const parsed = new URL(rawUrl, "http://serve-sim.local");
+  if (!parsed.pathname.startsWith(`${prefix}/page/`)) {
+    return null;
+  }
+  const suffix = parsed.pathname.slice(prefix.length);
+  return { upstreamPath: `/devtools${suffix}${parsed.search}` };
+}
+
 function helperProxyTarget(rawUrl: string, prefix: string): { device: string | null; upstreamPath: string } | null {
   const parsed = new URL(rawUrl, "http://serve-sim.local");
   if (parsed.pathname !== prefix && !parsed.pathname.startsWith(`${prefix}/`)) {
@@ -510,7 +523,12 @@ function sendBrowserFrame(socket: Socket, opcode: number, payload = Buffer.alloc
   socket.write(websocketFrame(opcode, payload));
 }
 
-function bridgeHelperWebSocket(req: SimReq, socket: Socket, head: Buffer, state: ServeSimState): void {
+type PendingWebSocketFrame = {
+  opcode: number;
+  payload: Buffer;
+};
+
+function bridgeWebSocketFrames(req: SimReq, socket: Socket, head: Buffer, upstreamUrl: string): void {
   const key = req.headers["sec-websocket-key"];
   if (typeof key !== "string") {
     socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
@@ -528,11 +546,11 @@ function bridgeHelperWebSocket(req: SimReq, socket: Socket, head: Buffer, state:
   );
   socket.resume();
 
-  const upstream = new WebSocket(state.wsUrl);
+  const upstream = new WebSocket(upstreamUrl);
   upstream.binaryType = "arraybuffer";
   let upstreamOpen = false;
   let closed = false;
-  let pendingToHelper: Buffer[] = [];
+  let pendingToUpstream: PendingWebSocketFrame[] = [];
   let buffered = Buffer.from(head);
 
   const closeBoth = () => {
@@ -543,12 +561,12 @@ function bridgeHelperWebSocket(req: SimReq, socket: Socket, head: Buffer, state:
     try { socket.destroy(); } catch {}
   };
 
-  const sendToHelper = (payload: Buffer) => {
+  const sendToUpstream = (frame: PendingWebSocketFrame) => {
     if (upstreamOpen && upstream.readyState === WebSocket.OPEN) {
-      upstream.send(payload);
+      upstream.send(frame.opcode === 0x1 ? frame.payload.toString("utf8") : frame.payload);
       return;
     }
-    pendingToHelper.push(Buffer.from(payload));
+    pendingToUpstream.push({ opcode: frame.opcode, payload: Buffer.from(frame.payload) });
   };
 
   const drainFrames = () => {
@@ -567,7 +585,7 @@ function bridgeHelperWebSocket(req: SimReq, socket: Socket, head: Buffer, state:
           continue;
         }
         if (frame.opcode === 0x1 || frame.opcode === 0x2) {
-          sendToHelper(frame.payload);
+          sendToUpstream({ opcode: frame.opcode, payload: frame.payload });
         }
       }
     } catch {
@@ -577,8 +595,10 @@ function bridgeHelperWebSocket(req: SimReq, socket: Socket, head: Buffer, state:
 
   upstream.onopen = () => {
     upstreamOpen = true;
-    for (const payload of pendingToHelper) upstream.send(payload);
-    pendingToHelper = [];
+    for (const frame of pendingToUpstream) {
+      upstream.send(frame.opcode === 0x1 ? frame.payload.toString("utf8") : frame.payload);
+    }
+    pendingToUpstream = [];
   };
   upstream.onmessage = (event) => {
     const data = event.data;
@@ -597,6 +617,10 @@ function bridgeHelperWebSocket(req: SimReq, socket: Socket, head: Buffer, state:
   socket.on("error", closeBoth);
   socket.on("close", closeBoth);
   drainFrames();
+}
+
+function bridgeHelperWebSocket(req: SimReq, socket: Socket, head: Buffer, state: ServeSimState): void {
+  bridgeWebSocketFrames(req, socket, head, state.wsUrl);
 }
 
 export function previewConfigForState(
@@ -756,22 +780,27 @@ async function ensureInspectWebKitBridge(): Promise<WebKitBridge> {
   return inspectWebKitBridge;
 }
 
-function devtoolsFrontendUrl(frontendBase: string, wsHost: string, targetId: string): string {
-  const url = new URL(`${frontendBase}/inspector.html`, "http://serve-sim.local");
-  url.searchParams.set("ws", `${wsHost}/devtools/page/${targetId}`);
-  return `${url.pathname}${url.search}`;
+function firstHeaderValue(value: string | string[] | undefined): string | undefined {
+  return Array.isArray(value) ? value[0] : value;
 }
 
-// The inspect-webkit bridge binds locally. Always emit `127.0.0.1` rather
-// than `localhost` for the iframe's WS URL: the chrome-devtools-frontend
-// inspector.html ships a CSP whose connect-src only whitelists
-// `ws://127.0.0.1:*` (plus `'self'`, which doesn't cover the bridge's
-// different port). A `ws://localhost:9222/...` connection from the iframe
-// gets CSP-blocked and surfaces as "WebSocket disconnected."
-// Non-local hostnames fall back to 127.0.0.1 since the bridge isn't
-// reachable from off-host anyway.
-function bridgeWsHost(_reqHost: string | undefined, bridgePort: number): string {
-  return `127.0.0.1:${bridgePort}`;
+function websocketProtocolForRequest(req: SimReq): "ws" | "wss" {
+  const forwardedProto = firstHeaderValue(req.headers["x-forwarded-proto"])
+    ?.split(",", 1)[0]
+    ?.trim()
+    .toLowerCase();
+  return forwardedProto === "https" ? "wss" : "ws";
+}
+
+function devtoolsFrontendUrl(
+  frontendBase: string,
+  wsParamName: "ws" | "wss",
+  wsTargetBase: string,
+  targetId: string,
+): string {
+  const url = new URL(`${frontendBase}/inspector.html`, "http://serve-sim.local");
+  url.searchParams.set(wsParamName, `${wsTargetBase}/page/${encodeURIComponent(targetId)}`);
+  return `${url.pathname}${url.search}`;
 }
 
 let _html: string | null = null;
@@ -983,6 +1012,8 @@ export interface SimMiddlewareOptions {
   execToken?: string;
   /** Force the preview UI to use MJPEG instead of AVCC/H.264. */
   disableAvcc?: boolean;
+  /** Test hook for supplying a fake inspect-webkit bridge. */
+  inspectWebKitBridge?: () => Promise<WebKitBridge>;
 }
 
 function safeEqualString(a: string, b: string): boolean {
@@ -1011,6 +1042,8 @@ function isJsonContentType(value: string | undefined): boolean {
 export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
   const base = (options?.basePath ?? "/.sim").replace(/\/+$/, "");
   const helperPrefix = helperProxyPrefix(base);
+  const devtoolsPrefix = devtoolsProxyPrefix(base);
+  const getInspectWebKitBridge = options?.inspectWebKitBridge ?? ensureInspectWebKitBridge;
   // Per-process random token. Anyone who can read the preview HTML same-origin
   // can call /exec; cross-origin pages and LAN clients cannot, because they
   // can't read this value (it's only injected into the preview page's config).
@@ -1272,17 +1305,18 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
           return;
         }
         try {
-          const bridge = await ensureInspectWebKitBridge();
+          const bridge = await getInspectWebKitBridge();
           const bridgeTargets = await bridge.listTargets();
-          const wsHost = bridgeWsHost(req.headers?.host, bridge.port);
+          const wsProtocol = websocketProtocolForRequest(req);
+          const wsTargetBase = `${hostForRequest(req) ?? `127.0.0.1:${bridge.port}`}${devtoolsPrefix}`;
           // inspect-webkit@0.0.3 only exposes `sim:<webinspectord-pid>` for
           // simulator targets, which can't be reconciled against a sim UDID.
           // Surface every booted sim's targets (Safari Develop-menu behavior)
           // until inspect-webkit grows a real UDID we can filter on.
           const targets = bridgeTargets.map((target) => ({
             ...target,
-            webSocketDebuggerUrl: `ws://${wsHost}/devtools/page/${encodeURIComponent(target.id)}`,
-            devtoolsFrontendUrl: devtoolsFrontendUrl(devtoolsFrontendBase, wsHost, target.id),
+            webSocketDebuggerUrl: `${wsProtocol}://${wsTargetBase}/page/${encodeURIComponent(target.id)}`,
+            devtoolsFrontendUrl: devtoolsFrontendUrl(devtoolsFrontendBase, wsProtocol, wsTargetBase, target.id),
           }));
           res.writeHead(200, {
             "Content-Type": "application/json",
@@ -1311,7 +1345,7 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
       req.on("end", async () => {
         try {
           const parsed: ReleaseRequestBody = body ? JSON.parse(body) : {};
-          const bridge = await ensureInspectWebKitBridge();
+          const bridge = await getInspectWebKitBridge();
           bridge.releaseHighlight?.(parsed.targetId);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end("{}");
@@ -1339,7 +1373,7 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
             res.end(JSON.stringify({ error: "Missing targetId" }));
             return;
           }
-          const bridge = await ensureInspectWebKitBridge();
+          const bridge = await getInspectWebKitBridge();
           if (!bridge.highlightTarget) {
             res.writeHead(501, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: "highlightTarget not supported by inspect-webkit" }));
@@ -1721,6 +1755,19 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
     const rawUrl = req.url ?? "";
     const selectedDevice = queryDevice(rawUrl) ?? options?.device ?? null;
     const helperTarget = helperProxyTarget(rawUrl, helperPrefix);
+    const devtoolsTarget = devtoolsProxyTarget(rawUrl, devtoolsPrefix);
+    if (devtoolsTarget) {
+      (async () => {
+        try {
+          const bridge = await getInspectWebKitBridge();
+          bridgeWebSocketFrames(req, socket, head, `ws://127.0.0.1:${bridge.port}${devtoolsTarget.upstreamPath}`);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : "Failed to start inspect-webkit";
+          socket.end(`HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n${message}`);
+        }
+      })();
+      return;
+    }
     if (!helperTarget) {
       socket.destroy();
       return;
