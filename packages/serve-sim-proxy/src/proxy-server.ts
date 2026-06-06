@@ -182,6 +182,12 @@ function forwardedHeaders(req: Request, host: string): Headers {
   return headers;
 }
 
+function previewHeaders(req: Request): Headers {
+  const headers = new Headers(req.headers);
+  headers.set("host", responseLocation(req).host);
+  return headers;
+}
+
 function requestBody(req: Request): BodyInit | undefined {
   return req.method === "GET" || req.method === "HEAD" ? undefined : req.body ?? undefined;
 }
@@ -401,7 +407,7 @@ async function proxyPreviewHttp(
   const upstream = previewUpstreamUrl(req, previewHost, previewPort);
   const upstreamRes = await fetch(upstream, {
     method: req.method,
-    headers: forwardedHeaders(req, `${previewHost}:${previewPort}`),
+    headers: previewHeaders(req),
     body: requestBody(req),
     signal: req.signal,
   });

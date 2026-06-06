@@ -169,6 +169,40 @@ describe("createServeSimProxyServer", () => {
     expect(events).toContain(`http://127.0.0.1:${proxyPort}/helper/${udid}/stream.mjpeg`);
   });
 
+  test("keeps /exec same-origin at the proxy surface", async () => {
+    const previewPort = await freePort();
+    preview = Bun.serve({
+      hostname: "127.0.0.1",
+      port: previewPort,
+      async fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname !== "/exec") return new Response("preview");
+        const origin = req.headers.get("origin");
+        const host = req.headers.get("host");
+        if (origin && new URL(origin).host !== host) {
+          return Response.json({ stdout: "", stderr: "Cross-origin request blocked", exitCode: 1 }, { status: 403 });
+        }
+        return Response.json({ stdout: await req.text(), stderr: "", exitCode: 0 });
+      },
+    });
+
+    const proxyPort = await freePort();
+    proxy = await createServeSimProxyServer({ port: proxyPort, previewPort });
+    const origin = `http://127.0.0.1:${proxyPort}`;
+    const res = await fetch(`${origin}/exec`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: origin,
+      },
+      body: JSON.stringify({ command: "echo hi" }),
+    });
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json.exitCode).toBe(0);
+  });
+
   test("proxies helper HTTP and bridges helper WebSocket traffic", async () => {
     const helperPort = await freePort();
     helper = Bun.serve<unknown>({
