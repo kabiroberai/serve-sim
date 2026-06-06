@@ -1,0 +1,30 @@
+{
+  "name": "serve-sim-proxy",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "serve-sim-proxy": "dist/index.js"
+  },
+  "exports": {
+    ".": {
+      "import": "./dist/proxy-server.js",
+      "types": "./src/proxy-server.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "bun build src/index.ts src/proxy-server.ts --outdir dist --target bun",
+    "dev": "bun run src/index.ts",
+    "test": "bun test src/__tests__"
+  },
+  "dependencies": {
+    "serve-sim": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.7.0"
+  }
+}
