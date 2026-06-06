@@ -90,6 +90,24 @@ describe("proxyWebKitDevtoolsResponse", () => {
     expect(frontend.searchParams.get("wss")).toBe("preview.example.test/.sim/devtools/page/sim%3Apage%3A1");
     expect(frontend.searchParams.has("ws")).toBe(false);
   });
+
+  test("uses 127.0.0.1 for loopback DevTools WebSockets to satisfy frontend CSP", () => {
+    const response = proxyWebKitDevtoolsResponse({
+      port: 9222,
+      targets: [{
+        id: "sim:page:1",
+        title: "Example",
+        url: "https://example.test",
+        type: "page",
+        webSocketDebuggerUrl: "ws://127.0.0.1:9222/devtools/page/sim%3Apage%3A1",
+        devtoolsFrontendUrl: "/devtools-frontend/inspector.html?ws=127.0.0.1%3A9222%2Fdevtools%2Fpage%2Fsim%253Apage%253A1",
+      }],
+    }, { protocol: "http:", host: "localhost:3300" }, "");
+
+    expect(response.targets[0]!.webSocketDebuggerUrl).toBe("ws://127.0.0.1:3300/devtools/page/sim%3Apage%3A1");
+    const frontend = new URL(response.targets[0]!.devtoolsFrontendUrl, "http://localhost:3300");
+    expect(frontend.searchParams.get("ws")).toBe("127.0.0.1:3300/devtools/page/sim%3Apage%3A1");
+  });
 });
 
 describe("createServeSimProxyServer", () => {

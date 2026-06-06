@@ -85,6 +85,38 @@ function helperPath(basePath: unknown, device: string): string {
   return `${base}/helper/${encodeURIComponent(device)}`;
 }
 
+function hostnameFromHost(host: string): string {
+  try {
+    return new URL(`http://${host}`).hostname;
+  } catch {
+    return host.split(":")[0] ?? host;
+  }
+}
+
+function portFromHost(host: string): string {
+  try {
+    return new URL(`http://${host}`).port;
+  } catch {
+    const match = /:(\d+)$/.exec(host);
+    return match?.[1] ?? "";
+  }
+}
+
+function devtoolsWebSocketLocation(location: LocationLike): { protocol: "ws:" | "wss:"; host: string; paramName: "ws" | "wss" } {
+  const hostname = hostnameFromHost(location.host);
+  const port = portFromHost(location.host);
+  if (
+    location.protocol === "http:"
+    && port
+    && (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]" || hostname === "::1")
+  ) {
+    return { protocol: "ws:", host: `127.0.0.1:${port}`, paramName: "ws" };
+  }
+  return location.protocol === "https:"
+    ? { protocol: "wss:", host: location.host, paramName: "wss" }
+    : { protocol: "ws:", host: location.host, paramName: "ws" };
+}
+
 export function proxyPreviewConfigForBrowser<T extends PreviewConfig | null | undefined>(
   config: T,
   location: LocationLike,
@@ -134,8 +166,7 @@ export function proxyWebKitDevtoolsResponse<T extends WebKitDevtoolsResponse>(
 ): T {
   if (!Array.isArray(response.targets)) return response;
   const base = normalizedBasePath(basePath);
-  const wsProtocol = location.protocol === "https:" ? "wss:" : "ws:";
-  const wsParamName = location.protocol === "https:" ? "wss" : "ws";
+  const wsLocation = devtoolsWebSocketLocation(location);
 
   return {
     ...response,
@@ -155,13 +186,13 @@ export function proxyWebKitDevtoolsResponse<T extends WebKitDevtoolsResponse>(
         const frontend = new URL(target.devtoolsFrontendUrl, `${location.protocol}//${location.host}`);
         frontend.searchParams.delete("ws");
         frontend.searchParams.delete("wss");
-        frontend.searchParams.set(wsParamName, `${location.host}${path}`);
+        frontend.searchParams.set(wsLocation.paramName, `${wsLocation.host}${path}`);
         devtoolsFrontendUrl = `${frontend.pathname}${frontend.search}${frontend.hash}`;
       } catch {}
 
       return {
         ...target,
-        webSocketDebuggerUrl: `${wsProtocol}//${location.host}${path}`,
+        webSocketDebuggerUrl: `${wsLocation.protocol}//${wsLocation.host}${path}`,
         devtoolsFrontendUrl,
       };
     }),
