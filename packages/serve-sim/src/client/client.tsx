@@ -30,6 +30,7 @@ import { DevicePicker } from "./components/device-picker";
 import { GridPanel } from "./components/grid-panel";
 import { ResizeHandle } from "./components/resize-handle";
 import { SimulatorResizeCornerHandle } from "./components/simulator-resize-corner-handle";
+import { ScreenshotToast } from "./components/screenshot-toast";
 import { SimulatorResizeSizeBadge } from "./components/simulator-resize-size-badge";
 import { ToolsPanel } from "./components/tools-panel";
 import { WebKitDevtoolsPanel } from "./components/webkit-devtools-panel";
@@ -37,6 +38,7 @@ import { useMediaDrop } from "./hooks/use-media-drop";
 import { useMjpegStream } from "./hooks/use-mjpeg-stream";
 import { useAvccStream } from "./hooks/use-avcc-stream";
 import { useResizableWidth } from "./hooks/use-resizable-width";
+import { useScreenshotToast } from "./hooks/use-screenshot-toast";
 import { useSimulatorResize } from "./hooks/use-simulator-resize";
 import { useUploadToasts } from "./hooks/use-upload-toasts";
 import { useWebKitDevtools } from "./hooks/use-webkit-devtools";
@@ -645,6 +647,7 @@ function AppWithConfig({
   }, [switching, config.device, setSwitching]);
 
   const uploads = useUploadToasts();
+  const screenshot = useScreenshotToast(config.device);
   const mediaDrop = useMediaDrop({
     exec: execOnHost,
     udid: config.device,
@@ -761,6 +764,10 @@ function AppWithConfig({
             )}
             <SimulatorToolbar.HomeButton
               onClick={(e) => { e.preventDefault(); onStreamButton("home"); }}
+            />
+            <SimulatorToolbar.ScreenshotButton
+              title="Screenshot"
+              onClick={(e) => { e.preventDefault(); void screenshot.capture(); }}
             />
             <AxToolbarButton
               overlayEnabled={axOverlayEnabled}
@@ -899,6 +906,18 @@ function AppWithConfig({
             );
           })}
         </div>
+      )}
+
+      {/* Screenshot pill — macOS-style "saved" popup: click reveals in Finder,
+          drag copies the file, and it animates out (timer pauses on hover). */}
+      {screenshot.toast && (
+        <ScreenshotToast
+          toast={screenshot.toast}
+          onReveal={screenshot.reveal}
+          onDismiss={screenshot.dismiss}
+          onPause={screenshot.pause}
+          onResume={screenshot.resume}
+        />
       )}
 
       {/* Right-edge sidebar rail. */}
