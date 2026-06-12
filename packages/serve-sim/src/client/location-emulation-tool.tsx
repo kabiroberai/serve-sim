@@ -39,6 +39,7 @@ import {
   WalkGlyph,
 } from "./icons";
 import { CollapsibleSection } from "./components/collapsible-section";
+import { Select } from "./components/select";
 
 const TRAIL_MORPH_MS = 650;
 
@@ -341,16 +342,13 @@ export function LocationEmulationTool({
     >
           <div className="flex flex-col gap-1">
             <div className="relative block">
-              <select
+              <Select
+                label="Trail"
                 value={trailId}
-                onChange={(e) => onTrailChange((e.target as HTMLSelectElement).value)}
-                className="lem-select appearance-none [-webkit-appearance:none] bg-white/[0.04] border border-white/8 rounded-md text-white/90 text-[12px] py-1.5 pr-[26px] pl-2 font-[inherit] cursor-pointer w-full [transition:background_0.12s,border-color_0.12s]"
-                aria-label="Trail"
-              >
-                {DEFAULT_TRAILS.map((t) => (
-                  <option key={t.id} value={t.id}>{t.name}</option>
-                ))}
-              </select>
+                onChange={onTrailChange}
+                options={DEFAULT_TRAILS.map((t) => ({ value: t.id, label: t.name }))}
+                className="lem-select bg-white/[0.04] border border-white/8 rounded-md text-white/90 text-[12px] py-1.5 pr-[26px] pl-2 w-full [transition:background_0.12s,border-color_0.12s]"
+              />
               <span className="absolute right-[9px] top-1/2 -translate-y-1/2 pointer-events-none flex items-center" aria-hidden="true">
                 <Chevron open={false} />
               </span>

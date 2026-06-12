@@ -8,6 +8,7 @@ import {
 } from "react";
 import { hostUiRequest } from "../utils/exec";
 import { CollapsibleSection } from "./collapsible-section";
+import { Select } from "./select";
 import { SettingSwitch } from "./setting-switch";
 
 // Simulator-wide UI options, mirroring the Xcode Devices app sidebar. Every
@@ -199,19 +200,14 @@ function SettingSelect({
   onChange: (next: string) => void;
 }) {
   return (
-    <select
-      aria-label={label}
+    <Select
+      label={label}
       value={value}
+      options={options}
       disabled={disabled}
-      onChange={(e) => onChange((e.target as HTMLSelectElement).value)}
-      className="appearance-none [-webkit-appearance:none] bg-white/[0.06] border border-white/10 rounded-md text-white/90 text-[12px] py-0.5 px-2 font-[inherit] cursor-pointer min-w-0 max-w-[150px] truncate disabled:cursor-default disabled:text-white/40"
-    >
-      {options.map((o) => (
-        <option key={o.value} value={o.value}>
-          {o.label}
-        </option>
-      ))}
-    </select>
+      onChange={onChange}
+      className="bg-white/[0.06] border border-white/10 rounded-md text-white/90 text-[12px] py-0.5 px-2 min-w-0 max-w-[150px] disabled:text-white/40"
+    />
   );
 }
 
