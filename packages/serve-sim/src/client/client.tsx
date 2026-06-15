@@ -56,6 +56,7 @@ import {
   GRID_PANEL_WIDTH,
   PANEL_WIDTH,
 } from "./utils/panel-widths";
+import { proxyPreviewConfigForBrowser } from "./utils/preview-config";
 import { simEndpoint, streamConfigFrom } from "./utils/sim-endpoint";
 import {
   SIMULATOR_RESIZE_DRAG_TRANSITION,
@@ -88,7 +89,9 @@ function previewConfigKey(config: PreviewConfig | null): string {
 }
 
 function App() {
-  const [config, setConfig] = useState<PreviewConfig | null>(() => streamConfigFrom(window.__SIM_PREVIEW__));
+  const [config, setConfig] = useState<PreviewConfig | null>(() =>
+    proxyPreviewConfigForBrowser(streamConfigFrom(window.__SIM_PREVIEW__), window.location)
+  );
   const [streaming, setStreaming] = useState(false);
   const [devices, setDevices] = useState<SimDevice[]>([]);
   const [devicesLoading, setDevicesLoading] = useState(false);
@@ -122,6 +125,7 @@ function App() {
 
     const applyConfig = (next: PreviewConfig | null) => {
       setConfig((prev) => {
+        next = proxyPreviewConfigForBrowser(streamConfigFrom(next), window.location);
         if (previewConfigKey(prev) === previewConfigKey(next)) return prev;
         if (next) {
           window.__SIM_PREVIEW__ = next;
@@ -427,13 +431,14 @@ function AppWithConfig({
   }, [config.wsUrl]);
 
   const sendWs = useCallback((tag: number, payload: object) => {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
     const json = new TextEncoder().encode(JSON.stringify(payload));
     const msg = new Uint8Array(1 + json.length);
     msg[0] = tag;
     msg.set(json, 1);
-    ws.send(msg);
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(msg);
+    }
   }, []);
 
   const onStreamTouch = useCallback((data: any) => sendWs(0x03, data), [sendWs]);
@@ -800,6 +805,7 @@ function AppWithConfig({
         >
           <SimulatorView
             url={config.url}
+            wsUrl={config.wsUrl}
             style={{
               width: "100%",
               height: "100%",

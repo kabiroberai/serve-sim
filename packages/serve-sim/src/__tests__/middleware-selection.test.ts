@@ -76,27 +76,51 @@ describe("rewriteStateForRequestHost", () => {
     expect(rewriteStateForRequestHost(state, undefined)).toBe(state);
   });
 
-  test("returns the state unchanged when the request is loopback", () => {
-    expect(rewriteStateForRequestHost(state, "localhost:8081")).toBe(state);
-    expect(rewriteStateForRequestHost(state, "127.0.0.1:8081")).toBe(state);
-    expect(rewriteStateForRequestHost(state, "[::1]:8081")).toBe(state);
-  });
-
-  test("rewrites the host portion for a LAN viewer, keeping the helper port", () => {
-    expect(rewriteStateForRequestHost(state, "192.168.1.42:8081")).toEqual({
+  test("rewrites loopback viewers through the same-origin helper proxy", () => {
+    expect(rewriteStateForRequestHost(state, "localhost:3200")).toEqual({
       ...state,
-      url: "http://192.168.1.42:3100",
-      streamUrl: "http://192.168.1.42:3100/stream.mjpeg",
-      wsUrl: "ws://192.168.1.42:3100/ws",
+      url: "http://localhost:3200/helper/DEVICE-A",
+      streamUrl: "http://localhost:3200/helper/DEVICE-A/stream.mjpeg",
+      wsUrl: "ws://localhost:3200/helper/DEVICE-A/ws",
+    });
+    expect(rewriteStateForRequestHost(state, "127.0.0.1:3200")).toEqual({
+      ...state,
+      url: "http://127.0.0.1:3200/helper/DEVICE-A",
+      streamUrl: "http://127.0.0.1:3200/helper/DEVICE-A/stream.mjpeg",
+      wsUrl: "ws://127.0.0.1:3200/helper/DEVICE-A/ws",
+    });
+    expect(rewriteStateForRequestHost(state, "[::1]:3200")).toEqual({
+      ...state,
+      url: "http://[::1]:3200/helper/DEVICE-A",
+      streamUrl: "http://[::1]:3200/helper/DEVICE-A/stream.mjpeg",
+      wsUrl: "ws://[::1]:3200/helper/DEVICE-A/ws",
     });
   });
 
-  test("rewrites the host portion for a tunneled hostname (no port)", () => {
+  test("rewrites LAN viewers through the same-origin helper proxy", () => {
+    expect(rewriteStateForRequestHost(state, "192.168.1.42:3200")).toEqual({
+      ...state,
+      url: "http://192.168.1.42:3200/helper/DEVICE-A",
+      streamUrl: "http://192.168.1.42:3200/helper/DEVICE-A/stream.mjpeg",
+      wsUrl: "ws://192.168.1.42:3200/helper/DEVICE-A/ws",
+    });
+  });
+
+  test("rewrites tunneled hostnames through the same-origin helper proxy", () => {
     expect(rewriteStateForRequestHost(state, "tunnel.example.com")).toEqual({
       ...state,
-      url: "http://tunnel.example.com:3100",
-      streamUrl: "http://tunnel.example.com:3100/stream.mjpeg",
-      wsUrl: "ws://tunnel.example.com:3100/ws",
+      url: "http://tunnel.example.com/helper/DEVICE-A",
+      streamUrl: "http://tunnel.example.com/helper/DEVICE-A/stream.mjpeg",
+      wsUrl: "ws://tunnel.example.com/helper/DEVICE-A/ws",
+    });
+  });
+
+  test("preserves middleware mount paths in helper proxy URLs", () => {
+    expect(rewriteStateForRequestHost(state, "localhost:8081", "/preview")).toEqual({
+      ...state,
+      url: "http://localhost:8081/preview/helper/DEVICE-A",
+      streamUrl: "http://localhost:8081/preview/helper/DEVICE-A/stream.mjpeg",
+      wsUrl: "ws://localhost:8081/preview/helper/DEVICE-A/ws",
     });
   });
 });

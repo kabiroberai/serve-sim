@@ -64,7 +64,7 @@ serve-sim camera --stop-webcam [-d udid]
                                       Stop the camera helper for a device
 
 Options:
-  -p, --port <port>   Starting port (preview default: 3200, stream default: 3100)
+  -p, --port <port>   Starting port (preview default: 3200; helper default: 3100)
   -d, --detach        Spawn helper and exit (daemon mode)
   -q, --quiet         JSON-only output
       --no-preview    Skip the web UI; stream in foreground only
@@ -206,9 +206,11 @@ app.use(simMiddleware({ basePath: "/.sim" }));
 // → preview HTML at /.sim
 // → state JSON  at /.sim/api
 // → SSE logs    at /.sim/logs
+// → helper proxy at /.sim/helper/<device>
+// → DevTools proxy at /.sim/devtools
 ```
 
-The middleware reads the helper's state from `$TMPDIR/serve-sim/` and forwards the user's browser to the live MJPEG + WebSocket endpoints. CORS is wide-open on the helper, so the page renders without a proxy.
+The middleware reads the helper's state from `$TMPDIR/serve-sim/` and serves the browser-facing stream, interaction WebSocket, and WebKit DevTools endpoints through same-origin `/helper/<device>` and `/devtools` URLs. For standalone `serve-sim`, that means remote users only need access to the preview port (default `3200`); the per-device helper port and inspect-webkit bridge can stay local to the host.
 
 ## How it works
 
