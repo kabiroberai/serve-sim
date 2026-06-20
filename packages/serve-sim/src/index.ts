@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { Command } from "commander";
+import { Command, InvalidArgumentError } from "commander";
 import { execSync, spawn as nodeSpawn, type ChildProcess } from "child_process";
 import { chmodSync, existsSync, mkdirSync, openSync, closeSync, readSync, readFileSync, unlinkSync, writeFileSync } from "fs";
 import { createHash } from "crypto";
@@ -993,6 +993,19 @@ async function rotate(orientation: string, deviceArg?: string) {
   });
 }
 
+// HID (page, usage) codes for hardware buttons not backed by a named idb event
+// source, mirroring DeviceKit chrome.json's per-input `usagePage`/`usage`. The
+// helper injects these through IndigoHIDMessageForHIDArbitrary.
+const HID_BUTTON_CODES: Record<string, { page: number; usage: number }> = {
+  power: { page: 12, usage: 48 },
+  "volume-up": { page: 12, usage: 233 },
+  "volume-down": { page: 12, usage: 234 },
+  action: { page: 11, usage: 45 },
+  "side-button": { page: 12, usage: 149 },
+  "digital-crown": { page: 12, usage: 64 },
+  "left-side-button": { page: 65281, usage: 512 },
+};
+
 async function button(buttonName = "home", deviceArg?: string) {
   const state = readState(deviceArg);
   if (!state) {
@@ -1000,12 +1013,15 @@ async function button(buttonName = "home", deviceArg?: string) {
     process.exit(1);
   }
 
+  const hid = HID_BUTTON_CODES[buttonName];
+  const payload = hid ? { button: buttonName, ...hid } : { button: buttonName };
+
   return new Promise<void>((resolve, reject) => {
     const ws = new WebSocket(state.wsUrl);
     ws.binaryType = "arraybuffer";
 
     ws.onopen = () => {
-      const json = new TextEncoder().encode(JSON.stringify({ button: buttonName }));
+      const json = new TextEncoder().encode(JSON.stringify(payload));
       const msg = new Uint8Array(1 + json.length);
       msg[0] = 0x04;
       msg.set(json, 1);
@@ -1762,7 +1778,7 @@ async function serve(
   devices: string[],
   portExplicit: boolean,
   host: string,
-  disableAvcc: boolean,
+  codec: string | undefined,
 ) {
   let targetDevice: string | undefined;
 
@@ -1782,7 +1798,9 @@ async function serve(
   }
 
   const { simMiddleware } = await import("./middleware");
-  const middleware = simMiddleware({ basePath: "/", device: targetDevice, disableAvcc });
+  // Standalone serve-sim owns its HTTP server and wires WebSocket upgrades, so
+  // it can route helper/DevTools sockets through the single preview port.
+  const middleware = simMiddleware({ basePath: "/", device: targetDevice, codec, proxyHelpers: true });
 
   // Try requested port; if busy and the user didn't pin it, scan forward.
   const maxScan = portExplicit ? 1 : 50;
@@ -1859,7 +1877,19 @@ program
   .option("--detach", "Spawn helper and exit (daemon mode)")
   .option("-q, --quiet", "Suppress human-readable output, JSON only")
   .option("--no-preview", "Skip the web preview server; stream in foreground only")
-  .option("--no-avcc", "Disable AVCC/H.264 video in the preview UI; force MJPEG")
+  .option(
+    "--codec <codec>",
+    "Stream codec for the preview UI: 'auto' (H.264 when the browser can decode " +
+      "it) or 'mjpeg' (force software JPEG — e.g. on VMs without H.264 encode).",
+    (value) => {
+      const v = value.toLowerCase();
+      const allowed = ["auto", "h264", "mjpeg"];
+      if (!allowed.includes(v)) {
+        throw new InvalidArgumentError(`Unsupported codec '${value}'. Supported: ${allowed.join(", ")}.`);
+      }
+      return v;
+    },
+  )
   .option("-l, --list [device]", "List running streams")
   .option("-k, --kill [device]", "Kill running stream(s)")
   .addHelpText(
@@ -1868,6 +1898,7 @@ program
 Examples:
   serve-sim                              Open simulator preview at localhost:3200
   serve-sim -p 8080                      Preview on a custom port
+  serve-sim --codec mjpeg                Force MJPEG (e.g. on VMs without H.264 encode)
   serve-sim --no-preview                 Auto-detect booted sim, stream in foreground
   serve-sim --no-preview "iPhone 16 Pro" Stream a specific device (no preview)
   serve-sim --detach                     Start streaming in background (daemon)
@@ -1890,7 +1921,7 @@ Examples:
     } else if (opts.preview === false) {
       await follow(devices, startPort ?? 3100, !!opts.quiet);
     } else {
-      await serve(startPort ?? 3200, devices, startPort !== undefined, opts.host, opts.avcc === false);
+      await serve(startPort ?? 3200, devices, startPort !== undefined, opts.host, opts.codec);
     }
   });
 

@@ -13,6 +13,14 @@ app.setActivationPolicy(.accessory)
 
 let args = CommandLine.arguments
 
+// Diagnostic: capture ground-truth scroll bytes from a real SimHIDCaptureManager
+// session. Usage: serve-sim-bin --capture-scroll <udid> [seconds]
+if args.count >= 3, args[1] == "--capture-scroll" {
+    let secs = args.count >= 4 ? (Double(args[3]) ?? 20) : 20
+    CaptureScroll.run(udid: args[2], seconds: secs)
+    // CaptureScroll.run calls exit(); this is unreachable.
+}
+
 guard args.count >= 2 else {
     fputs("Usage: serve-sim-bin <device-udid> [--port 3100]\n", stderr)
     exit(1)
@@ -80,6 +88,9 @@ httpServer.clientManager.onTouch = { touch in
 httpServer.clientManager.onButton = { button in
     hidInjector.sendButton(button: button, deviceUDID: deviceUDID)
 }
+httpServer.clientManager.onButtonHID = { page, usage, phase in
+    hidInjector.sendButtonHID(page: page, usage: usage, phase: phase)
+}
 httpServer.clientManager.onMultiTouch = { multiTouch in
     hidInjector.sendMultiTouch(type: multiTouch.type,
                                x1: multiTouch.x1, y1: multiTouch.y1,
@@ -100,6 +111,13 @@ httpServer.clientManager.onMemoryWarning = {
 }
 httpServer.clientManager.onDigitalCrown = { payload in
     hidInjector.sendDigitalCrown(delta: payload.delta)
+}
+httpServer.clientManager.onScroll = { payload in
+    // Payload deltas are a fraction of the display; scale to device pixels.
+    hidInjector.sendScroll(dx: payload.dx * Double(screenWidth),
+                           dy: payload.dy * Double(screenHeight),
+                           anchorX: payload.x, anchorY: payload.y,
+                           screenWidth: screenWidth, screenHeight: screenHeight)
 }
 
 // Start HTTP + WebSocket server

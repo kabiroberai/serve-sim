@@ -96,6 +96,7 @@ describe("devtools proxy", () => {
       port: previewPort,
       middleware: simMiddleware({
         basePath: "/",
+        proxyHelpers: true,
         inspectWebKitBridge: async () => bridge,
       }),
       host: "127.0.0.1",

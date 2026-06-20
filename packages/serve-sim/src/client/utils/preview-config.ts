@@ -8,6 +8,11 @@ export function proxyPreviewConfigForBrowser(
 ): PreviewConfig | null {
   if (!config) return null;
   if (!config.device) return config;
+  // Only re-anchor when the server opted into same-origin proxying. Without it
+  // the config already holds the helper's direct URLs (embedded mounts), and
+  // rewriting them to `/helper/...` would point at routes the host server
+  // doesn't proxy.
+  if (!config.proxyHelpers) return config;
 
   const basePath = config.basePath === "/"
     ? ""

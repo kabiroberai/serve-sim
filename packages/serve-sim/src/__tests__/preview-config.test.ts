@@ -10,6 +10,9 @@ const baseConfig = {
   wsUrl: "ws://127.0.0.1:3100/ws",
   basePath: "",
   execToken: "token",
+  // The server only re-anchors helper URLs to the browser origin when it opted
+  // into same-origin proxying.
+  proxyHelpers: true as const,
 };
 
 describe("proxyPreviewConfigForBrowser", () => {
@@ -43,5 +46,12 @@ describe("proxyPreviewConfigForBrowser", () => {
       streamUrl: "https://tunnel.example.com/.sim/helper/DEVICE-A/stream.mjpeg",
       wsUrl: "wss://tunnel.example.com/.sim/helper/DEVICE-A/ws",
     });
+  });
+
+  test("leaves the config untouched when the server didn't opt into proxying", () => {
+    const direct = { ...baseConfig, proxyHelpers: undefined } as NonNullable<Window["__SIM_PREVIEW__"]>;
+    expect(
+      proxyPreviewConfigForBrowser(direct, { protocol: "http:", host: "example.test:3200" }),
+    ).toBe(direct);
   });
 });

@@ -191,7 +191,10 @@ export async function servePreview(opts: {
   await new Promise<void>((resolve, reject) => {
     const onError = (err: Error & { code?: string }) => {
       frontServer.removeListener("listening", onListening);
-      reject(err);
+      // The internal server is already listening; if the front fails to bind
+      // (e.g. EADDRINUSE during the port-scan retry loop), close it too so we
+      // don't leak a listener per attempt.
+      internalServer.close(() => reject(err));
     };
     const onListening = () => {
       frontServer.removeListener("error", onError);

@@ -27,12 +27,16 @@ final class ClientManager {
 
     var onTouch: ((TouchEventPayload) -> Void)?
     var onButton: ((String) -> Void)?
+    /// Arbitrary HID hardware button by (page, usage, phase) — power / volume /
+    /// action / side button, etc. Carried from DeviceKit chrome.json.
+    var onButtonHID: ((_ page: UInt32, _ usage: UInt32, _ phase: String) -> Void)?
     var onMultiTouch: ((MultiTouchEventPayload) -> Void)?
     var onKey: ((KeyEventPayload) -> Void)?
     var onOrientation: ((UInt32) -> Bool)?
     var onCADebug: ((CADebugEventPayload) -> Void)?
     var onMemoryWarning: (() -> Void)?
     var onDigitalCrown: ((DigitalCrownEventPayload) -> Void)?
+    var onScroll: ((ScrollEventPayload) -> Void)?
 
     // MARK: - Configuration
 
@@ -207,7 +211,11 @@ final class ClientManager {
             onTouch?(json)
         } else if type == 0x04 { // WS_MSG_BUTTON
             guard let json = try? JSONDecoder().decode(ButtonEventPayload.self, from: data[1...]) else { return }
-            onButton?(json.button)
+            if let page = json.page, let usage = json.usage {
+                onButtonHID?(page, usage, json.phase ?? "press")
+            } else {
+                onButton?(json.button)
+            }
         } else if type == 0x05 { // WS_MSG_MULTI_TOUCH
             guard let json = try? JSONDecoder().decode(MultiTouchEventPayload.self, from: data[1...]) else { return }
             onMultiTouch?(json)
@@ -239,6 +247,9 @@ final class ClientManager {
         } else if type == 0x0A { // WS_MSG_DIGITAL_CROWN
             guard let json = try? JSONDecoder().decode(DigitalCrownEventPayload.self, from: data[1...]) else { return }
             onDigitalCrown?(json)
+        } else if type == 0x0B { // WS_MSG_SCROLL
+            guard let json = try? JSONDecoder().decode(ScrollEventPayload.self, from: data[1...]) else { return }
+            onScroll?(json)
         }
     }
 

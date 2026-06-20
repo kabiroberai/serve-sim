@@ -10,11 +10,13 @@ import type { StreamConfig } from "../types.js";
 import {
   HID_EDGE_BOTTOM,
   homeIndicatorEdge,
+  rawDeltaForDisplayDelta,
   rawEdgeForDisplayEdge,
   rawPointForDisplayPoint,
   streamDisplayGeometry,
 } from "./orientation.js";
 import { digitalCrownDeltaFromWheel } from "./digitalCrown.js";
+import { wheelDeltaToPixels } from "./scroll-wheel.js";
 import { useAvccStream } from "./use-avcc-stream.js";
 import { isAvccSupported } from "../avcc-codec.js";
 
@@ -30,6 +32,7 @@ const WS_MSG_TOUCH = 0x03;
 const WS_MSG_BUTTON = 0x04;
 const WS_MSG_MULTI_TOUCH = 0x05;
 const WS_MSG_DIGITAL_CROWN = 0x0a;
+const WS_MSG_SCROLL = 0x0b;
 
 export interface SimulatorViewProps {
   /** Base URL of the serve-sim server, e.g. "http://localhost:3100" */
@@ -50,6 +53,10 @@ export interface SimulatorViewProps {
   onStreamButton?: (button: string) => void;
   /** Relay mode: callback for Digital Crown rotation events */
   onStreamDigitalCrown?: (delta: number) => void;
+  /** Relay mode: callback for scroll-wheel / trackpad pan events. Deltas and the
+   * `x`/`y` cursor anchor are a fraction of the display in raw device orientation
+   * (positive dy = content down). The anchor is where the pan gesture begins. */
+  onStreamScroll?: (data: { dx: number; dy: number; x: number; y: number }) => void;
   /** Enables mouse-wheel/trackpad Digital Crown rotation forwarding. */
   enableDigitalCrown?: boolean;
   /** Relay mode: subscribe to frame updates (bypasses React state for performance).
@@ -78,6 +85,12 @@ export interface SimulatorViewProps {
    * `useAvcc` and `useAvccStream` only need `url` to read `/stream.avcc`.
    */
   codec?: "mjpeg" | "avcc";
+  /**
+   * Called when the AVCC (H.264) WebCodecs decoder fails fatally, so the parent
+   * can downgrade to MJPEG instead of retrying hardware decode forever. Fires
+   * only on the AVCC path; inert under MJPEG.
+   */
+  onAvccError?: () => void;
 }
 
 /**
@@ -100,6 +113,7 @@ export function SimulatorView({
   onStreamMultiTouch,
   onStreamButton,
   onStreamDigitalCrown,
+  onStreamScroll,
   enableDigitalCrown,
   subscribeFrame,
   streamFrame: _streamFrame,
@@ -109,6 +123,7 @@ export function SimulatorView({
   onStreamingChange,
   connectionQuality,
   codec = "avcc",
+  onAvccError,
 }: SimulatorViewProps) {
   const relayMode = !!onStreamTouch;
   // AVCC decode is independent of input relay: the H.264 pipeline only needs
@@ -207,10 +222,18 @@ export function SimulatorView({
     }
   }, [relayMode, streamConfig, updateScreenConfig]);
 
-  // In relay mode, subscribe to frames and update img.src directly (bypasses React)
+  // In relay mode, subscribe to frames and update img.src directly (bypasses React).
   const connectedRef = useRef(false);
   connectedRef.current = connected;
-  const prevBlobUrlRef = useRef<string | null>(null);
+  // Latest received-but-not-yet-painted frame, and the one currently shown.
+  // Painting is drained on requestAnimationFrame (latest wins; stale frames
+  // are dropped and their blob URLs released) so a browser that can't keep up
+  // never queues an img.src assignment + JPEG decode for every received frame.
+  // That per-frame work on the main thread is what freezes weak browsers — the
+  // ones without WebCodecs that fall back to this MJPEG path — under the high
+  // frame rate of heavy interaction. Mirrors the AVCC canvas single-frame queue.
+  const pendingBlobUrlRef = useRef<string | null>(null);
+  const paintedBlobUrlRef = useRef<string | null>(null);
   useEffect(() => {
     // AVCC paints the canvas via useAvccStream; skip the MJPEG relay <img>.
     if (!relayMode || !subscribeFrame || useAvcc) return;
@@ -224,18 +247,31 @@ export function SimulatorView({
         setError("Stream is not producing frames. The simulator may have stopped — try reconnecting.");
       }
     }, STARTUP_MS);
-    const unsubscribe = subscribeFrame((blobUrl) => {
-      frameCountRef.current++;
-      lastFrameAtRef.current = Date.now();
-      const img = relayImgRef.current;
-      if (img) {
-        // Revoke the previous blob URL to avoid memory leaks
-        if (prevBlobUrlRef.current) {
-          URL.revokeObjectURL(prevBlobUrlRef.current);
+
+    let rafId = requestAnimationFrame(function paint() {
+      const next = pendingBlobUrlRef.current;
+      if (next) {
+        pendingBlobUrlRef.current = null;
+        const img = relayImgRef.current;
+        if (img) {
+          // Release the frame we're replacing; its decode is now moot.
+          if (paintedBlobUrlRef.current) URL.revokeObjectURL(paintedBlobUrlRef.current);
+          paintedBlobUrlRef.current = next;
+          img.src = next;
+          frameCountRef.current++;
+        } else {
+          URL.revokeObjectURL(next);
         }
-        prevBlobUrlRef.current = blobUrl;
-        img.src = blobUrl;
       }
+      rafId = requestAnimationFrame(paint);
+    });
+
+    const unsubscribe = subscribeFrame((blobUrl) => {
+      lastFrameAtRef.current = Date.now();
+      // Latest-wins: a frame that arrived since the last paint is now stale —
+      // release it so blob URLs don't accumulate between animation frames.
+      if (pendingBlobUrlRef.current) URL.revokeObjectURL(pendingBlobUrlRef.current);
+      pendingBlobUrlRef.current = blobUrl;
       if (!connectedRef.current) {
         clearTimeout(watchdog);
         setConnected(true);
@@ -244,10 +280,15 @@ export function SimulatorView({
     });
     return () => {
       clearTimeout(watchdog);
+      cancelAnimationFrame(rafId);
       unsubscribe?.();
-      if (prevBlobUrlRef.current) {
-        URL.revokeObjectURL(prevBlobUrlRef.current);
-        prevBlobUrlRef.current = null;
+      if (pendingBlobUrlRef.current) {
+        URL.revokeObjectURL(pendingBlobUrlRef.current);
+        pendingBlobUrlRef.current = null;
+      }
+      if (paintedBlobUrlRef.current) {
+        URL.revokeObjectURL(paintedBlobUrlRef.current);
+        paintedBlobUrlRef.current = null;
       }
     };
   }, [relayMode, subscribeFrame, useAvcc]);
@@ -278,6 +319,7 @@ export function SimulatorView({
     onFirstFrame: onAvccFirstFrame,
     onFrame: onAvccFrame,
     onError: setError,
+    onDecoderError: onAvccError,
   });
 
   const sendTouch = useCallback(
@@ -339,6 +381,30 @@ export function SimulatorView({
     msg.set(json, 1);
     ws.send(msg);
   }, [relayMode, onStreamDigitalCrown]);
+
+  const sendScroll = useCallback(
+    (dx: number, dy: number, anchorX: number, anchorY: number) => {
+      if (!Number.isFinite(dx) || !Number.isFinite(dy) || (dx === 0 && dy === 0)) return;
+      // Rotate both the delta and the cursor anchor into raw device orientation so
+      // scrolling tracks the visible content on landscape / upside-down devices.
+      const orientation = streamDisplayGeometry(screenSizeRef.current).inputOrientation;
+      const rawDelta = rawDeltaForDisplayDelta(orientation, dx, dy);
+      const rawAnchor = rawPointForDisplayPoint(orientation, anchorX, anchorY);
+      const payload = { dx: rawDelta.dx, dy: rawDelta.dy, x: rawAnchor.x, y: rawAnchor.y };
+      if (relayMode) {
+        onStreamScroll?.(payload);
+        return;
+      }
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      const json = new TextEncoder().encode(JSON.stringify(payload));
+      const msg = new Uint8Array(1 + json.length);
+      msg[0] = WS_MSG_SCROLL;
+      msg.set(json, 1);
+      ws.send(msg);
+    },
+    [relayMode, onStreamScroll],
+  );
 
   const sendMultiTouch = useCallback(
     (touch: {
@@ -534,21 +600,6 @@ export function SimulatorView({
     [getInputRect, sendDigitalCrown],
   );
 
-  useEffect(() => {
-    if (!enableDigitalCrown) return;
-    const el = inputLayerRef.current;
-    if (!el) return;
-
-    const onWheel = (event: globalThis.WheelEvent) => {
-      const handled = handleDigitalCrownWheelDelta(event.deltaY, event.deltaMode);
-      if (!handled) return;
-      event.preventDefault();
-      event.stopPropagation();
-    };
-
-    el.addEventListener("wheel", onWheel, { passive: false });
-    return () => el.removeEventListener("wheel", onWheel);
-  }, [enableDigitalCrown, handleDigitalCrownWheelDelta]);
 
   // Bottom-edge gesture: forward touches with edge=3 (bottom) so iOS
   // handles the interactive home indicator animation natively.
@@ -644,6 +695,49 @@ export function SimulatorView({
       el.style.display = "none";
     }
   }, []);
+
+  // Scroll-to-pan: mouse-wheel/trackpad scrolling over the device is forwarded
+  // as a native scroll event so iOS pans content exactly as it would for a
+  // physical scroll wheel — no synthesized finger drag.
+  const handleScrollWheel = useCallback(
+    (event: globalThis.WheelEvent) => {
+      // Don't fight an in-progress pointer/touch drag on the same surface.
+      if (touchActiveRef.current || multiTouchActiveRef.current) return false;
+      const rect = getInputRect();
+      if (!rect) return false;
+      const dxPx = wheelDeltaToPixels(event.deltaX, event.deltaMode, rect.width);
+      const dyPx = wheelDeltaToPixels(event.deltaY, event.deltaMode, rect.height);
+      if (dxPx === 0 && dyPx === 0) return false;
+      // Anchor the pan under the cursor so iOS pans the view beneath the pointer
+      // (e.g. a bottom sheet vs. the map behind it), clamped to the display.
+      const anchorX = Math.min(Math.max((event.clientX - rect.left) / rect.width, 0), 1);
+      const anchorY = Math.min(Math.max((event.clientY - rect.top) / rect.height, 0), 1);
+      // Express the delta as a fraction of the rendered display so the server can
+      // rescale to the device's pixel dimensions. Browser wheel deltas already
+      // reflect the user's natural-scroll setting, so the sign passes straight
+      // through to match a real scroll wheel.
+      sendScroll(dxPx / rect.width, dyPx / rect.height, anchorX, anchorY);
+      return true;
+    },
+    [getInputRect, sendScroll],
+  );
+
+  useEffect(() => {
+    const el = inputLayerRef.current;
+    if (!el) return;
+
+    const onWheel = (event: globalThis.WheelEvent) => {
+      const handled = enableDigitalCrown
+        ? handleDigitalCrownWheelDelta(event.deltaY, event.deltaMode)
+        : handleScrollWheel(event);
+      if (!handled) return;
+      event.preventDefault();
+      event.stopPropagation();
+    };
+
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [enableDigitalCrown, handleDigitalCrownWheelDelta, handleScrollWheel]);
 
   const lastHomeClickRef = useRef(0);
   const homeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);

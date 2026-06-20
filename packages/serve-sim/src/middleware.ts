@@ -6,8 +6,19 @@ import { createServer as createNetServer } from "net";
 import { createHash, randomBytes, timingSafeEqual } from "crypto";
 import { request as httpRequest, type IncomingMessage, type ServerResponse } from "http";
 import type { Socket } from "net";
+// `ws` (kept external in the build) supplies a WebSocket *client* for the
+// helper/devtools proxy. Node only exposes a global `WebSocket` on newer LTS
+// lines, and `serve-sim/middleware` is embedded in third-party dev servers, so
+// importing the dependency keeps the proxy working regardless of runtime.
+import { WebSocket } from "ws";
 import { createAxStreamerCache } from "./ax";
 import { debugMw } from "./debug";
+import {
+  resolveDevicePlaceholderAsset,
+  resolveDeviceKitChrome,
+  serveDeviceKitChromeAsset,
+  serveDevicePlaceholderAsset,
+} from "./devicekit-chrome";
 import { createExecUpgradeHandler, type UiRequestHandler } from "./exec-ws";
 import { UI_OPTIONS, getUiStatus, normalizeUiValue, setUiOption } from "./ui-settings";
 
@@ -213,7 +224,30 @@ function getBootedUdids(): Set<string> | null {
   }
 }
 
-function readServeSimStates(): ServeSimState[] {
+// The device the user most recently opened in Simulator.app, regardless of
+// which tool launched it. Simulator.app persists this as CurrentDeviceUDID, so
+// it's the best signal for "the device this user actually cares about" — we
+// surface it near the top of the grid the way Xcode's Devices window does.
+let preferredSnapshot: { at: number; udid: string | null } = { at: 0, udid: null };
+function getPreferredDeviceUdid(): string | null {
+  const now = Date.now();
+  if (now - preferredSnapshot.at < 1500) return preferredSnapshot.udid;
+  let udid: string | null = null;
+  try {
+    udid =
+      execSync("defaults read com.apple.iphonesimulator CurrentDeviceUDID", {
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 1500,
+      }).trim() || null;
+  } catch {
+    udid = null;
+  }
+  preferredSnapshot = { at: now, udid };
+  return udid;
+}
+
+export function readServeSimStates(): ServeSimState[] {
   let files: string[];
   try {
     files = readdirSync(STATE_DIR).filter(
@@ -284,24 +318,54 @@ function endpoint(base: string, path: string, device: string): string {
 }
 
 /**
- * Rewrite the helper URLs in a state so browser clients reach the helper via
- * the preview server's same-origin `/helper` proxy. The CLI and state files
- * keep using the helper's loopback port for direct local control, but the web
- * UI no longer requires exposing that separate port to LAN/tunnel users.
+ * Rewrite the helper URLs in a state for the requesting browser.
+ *
+ * When `proxy` is set (standalone `serve-sim`, which owns its server and wires
+ * WebSocket upgrades), the URLs point at the preview's same-origin `/helper`
+ * proxy so remote viewers only need the one preview port. When it's off — the
+ * default for embedded `app.use(simMiddleware(...))` mounts, where the host's
+ * server doesn't forward `upgrade` events to `handleUpgrade` — the helper's
+ * loopback URLs are emitted directly (with `127.0.0.1` swapped for the request
+ * hostname so LAN/tunnel viewers can still reach the separate helper port).
  */
 export function rewriteStateForRequestHost(
   state: ServeSimState,
   hostHeader: string | undefined,
   base = "",
+  protocol: "http" | "https" = "http",
+  proxy = false,
 ): ServeSimState {
   if (!hostHeader) {
     return state;
   }
+  if (!proxy) {
+    let hostname: string;
+    try {
+      hostname = new URL(`http://${hostHeader}`).hostname;
+    } catch {
+      return state;
+    }
+    // `URL.hostname` keeps brackets around IPv6 literals, so the IPv6 loopback
+    // comparison is against the bracketed form rather than `::1`.
+    if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]") {
+      return state;
+    }
+    const rewrite = (s: string) => s.replace("127.0.0.1", hostname);
+    return {
+      ...state,
+      url: rewrite(state.url),
+      streamUrl: rewrite(state.streamUrl),
+      wsUrl: rewrite(state.wsUrl),
+    };
+  }
   const normalizedBase = base === "/" ? "" : base.replace(/\/+$/, "");
   const helperBase = `${normalizedBase}/helper`;
   const devicePath = `${helperBase}/${encodeURIComponent(state.device)}`;
-  const origin = `http://${hostHeader}`;
-  const wsOrigin = `ws://${hostHeader}`;
+  // Match the request's scheme so an HTTPS-served preview doesn't hand the
+  // browser `http`/`ws` helper URLs (blocked as mixed content). Behind a proxy
+  // the original scheme arrives via `x-forwarded-proto`.
+  const origin = `${protocol}://${hostHeader}`;
+  const wsOrigin = `${protocol === "https" ? "wss" : "ws"}://${hostHeader}`;
   return {
     ...state,
     url: `${origin}${devicePath}`,
@@ -558,10 +622,10 @@ export function previewConfigForState(
   base: string,
   serveSimBin: string,
   execToken: string,
-  disableAvcc = false,
+  codec?: string,
+  proxyHelpers = false,
 ): ServeSimState & {
   basePath: string;
-  logsEndpoint: string;
   appStateEndpoint: string;
   axEndpoint: string;
   devtoolsEndpoint: string;
@@ -572,13 +636,13 @@ export function previewConfigForState(
   gridMemoryEndpoint: string;
   previewEndpoint: string;
   execToken: string;
-  disableAvcc: boolean;
+  codec?: string;
+  proxyHelpers?: boolean;
 } {
   const gridApiBase = (base === "" ? "" : base) + "/grid/api";
   return {
     ...state,
     basePath: base,
-    logsEndpoint: endpoint(base, "/logs", state.device),
     appStateEndpoint: endpoint(base, "/appstate", state.device),
     axEndpoint: endpoint(base, "/ax", state.device),
     devtoolsEndpoint: endpoint(base, "/devtools", state.device),
@@ -589,7 +653,8 @@ export function previewConfigForState(
     gridMemoryEndpoint: gridApiBase + "/memory",
     previewEndpoint: base === "" ? "/" : base,
     execToken,
-    disableAvcc,
+    ...(codec ? { codec } : {}),
+    ...(proxyHelpers ? { proxyHelpers: true } : {}),
   };
 }
 
@@ -711,12 +776,19 @@ function firstHeaderValue(value: string | string[] | undefined): string | undefi
   return Array.isArray(value) ? value[0] : value;
 }
 
-function websocketProtocolForRequest(req: SimReq): "ws" | "wss" {
-  const forwardedProto = firstHeaderValue(req.headers["x-forwarded-proto"])
+function forwardedProtoForRequest(req: SimReq): string | undefined {
+  return firstHeaderValue(req.headers["x-forwarded-proto"])
     ?.split(",", 1)[0]
     ?.trim()
     .toLowerCase();
-  return forwardedProto === "https" ? "wss" : "ws";
+}
+
+function websocketProtocolForRequest(req: SimReq): "ws" | "wss" {
+  return forwardedProtoForRequest(req) === "https" ? "wss" : "ws";
+}
+
+function httpProtocolForRequest(req: SimReq): "http" | "https" {
+  return forwardedProtoForRequest(req) === "https" ? "https" : "http";
 }
 
 function devtoolsFrontendUrl(
@@ -756,6 +828,7 @@ interface SimctlDevice {
   name: string;
   state: string;
   isAvailable?: boolean;
+  deviceTypeIdentifier?: string;
   runtime: string;
 }
 
@@ -937,8 +1010,24 @@ export interface SimMiddlewareOptions {
    * cross-origin pages cannot read it.
    */
   execToken?: string;
-  /** Force the preview UI to use MJPEG instead of AVCC/H.264. */
-  disableAvcc?: boolean;
+  /**
+   * Pin the preview stream codec. `"mjpeg"` forces the software JPEG path for
+   * hosts whose hardware can't encode H.264 (e.g. VMs without the high/low-
+   * latency H.264 profiles); `"auto"`/undefined lets the browser pick H.264.
+   * Reserved for future values such as `"hevc"`/`"av1"`.
+   */
+  codec?: string;
+  /**
+   * Route the browser's helper stream/control and DevTools sockets through the
+   * preview's same-origin `/helper` and `/devtools` proxies instead of the
+   * helper's own loopback port — so a single exposed preview port is enough for
+   * remote viewers. Requires the mounting server to forward WebSocket `upgrade`
+   * events to {@link SimMiddleware.handleUpgrade}. Standalone `serve-sim`
+   * enables this; plain `app.use(simMiddleware(...))` mounts leave it off (and
+   * keep direct helper URLs) unless they also wire upgrades. See the README's
+   * "Embed in your dev server" section.
+   */
+  proxyHelpers?: boolean;
   /** Test hook for supplying a fake inspect-webkit bridge. */
   inspectWebKitBridge?: () => Promise<WebKitBridge>;
 }
@@ -963,13 +1052,13 @@ function isJsonContentType(value: string | undefined): boolean {
  * Routes handled under `basePath` (default `/.sim`):
  *   GET  {basePath}         — the preview HTML page
  *   GET  {basePath}/api     — serve-sim state JSON
- *   GET  {basePath}/logs    — SSE stream of simctl logs
  *   GET  {basePath}/ax      — SSE stream of normalized accessibility snapshots
  */
 export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
   const base = (options?.basePath ?? "/.sim").replace(/\/+$/, "");
   const helperPrefix = helperProxyPrefix(base);
   const devtoolsPrefix = devtoolsProxyPrefix(base);
+  const proxyHelpers = options?.proxyHelpers ?? false;
   const getInspectWebKitBridge = options?.inspectWebKitBridge ?? ensureInspectWebKitBridge;
   // Per-process random token. Anyone who can read the preview HTML same-origin
   // can call /exec; cross-origin pages and LAN clients cannot, because they
@@ -1066,8 +1155,8 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
       }
 
       if (state) {
-        const remoteState = rewriteStateForRequestHost(state, hostForRequest(req), base);
-        const config = JSON.stringify(previewConfigForState(remoteState, base, serveSimBinPath(), execToken, !!options?.disableAvcc));
+        const remoteState = rewriteStateForRequestHost(state, hostForRequest(req), base, httpProtocolForRequest(req), proxyHelpers);
+        const config = JSON.stringify(previewConfigForState(remoteState, base, serveSimBinPath(), execToken, options?.codec, proxyHelpers));
         const configScript = `<script>window.__SIM_PREVIEW__=${config}</script>`;
         html = html.replace("<!--__SIM_PREVIEW_CONFIG__-->", configScript);
       }
@@ -1090,6 +1179,16 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
       return;
     }
 
+    if (url === base + "/grid/api/devicekit-chrome") {
+      serveDeviceKitChromeAsset(new URL(rawUrl || "/", "http://serve-sim.local"), res);
+      return;
+    }
+
+    if (url === base + "/grid/api/device-placeholder-asset") {
+      serveDevicePlaceholderAsset(new URL(rawUrl || "/", "http://serve-sim.local"), res);
+      return;
+    }
+
     // Grid JSON: every supported simulator, annotated with running helper info if any.
     if (url === base + "/grid/api") {
       const states = readServeSimStates();
@@ -1097,12 +1196,14 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
       const sims = listAllSimulators();
       const devices = sims.map((d) => {
         const helper = helperByUdid.get(d.udid);
-        const remoteHelper = helper ? rewriteStateForRequestHost(helper, hostForRequest(req), base) : null;
+        const remoteHelper = helper ? rewriteStateForRequestHost(helper, hostForRequest(req), base, httpProtocolForRequest(req), proxyHelpers) : null;
         return {
           device: d.udid,
           name: d.name,
           runtime: d.runtime,
           state: d.state,
+          chrome: resolveDeviceKitChrome(d),
+          placeholderAsset: resolveDevicePlaceholderAsset(d),
           helper: remoteHelper
             ? {
                 port: remoteHelper.port,
@@ -1113,9 +1214,13 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
             : null,
         };
       });
-      // Stable order: family (iPhone, iPad, Watch, TV, Vision, other) →
-      // state (helper > booted > shutdown) → alpha. Keeps the most
-      // commonly used devices visible without scrolling.
+      // Order mirrors Xcode's Devices window: the devices the user is actually
+      // using float to the top — streaming first, then booted, then the
+      // simulator they last opened in Simulator.app — and everything else falls
+      // back to a stable family / newest-OS / name grouping. This surfaces the
+      // handful of relevant devices instead of burying them in an alphabetical
+      // wall of near-identical names.
+      const preferredUdid = getPreferredDeviceUdid();
       const familyRank = (name: string): number => {
         if (/iphone/i.test(name)) return 0;
         if (/ipad/i.test(name)) return 1;
@@ -1124,12 +1229,21 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
         if (/vision|reality/i.test(name)) return 4;
         return 5;
       };
+      // Lower is higher in the list: streaming > booted > last-opened > rest.
       const stateRank = (x: typeof devices[number]) =>
-        x.helper ? 0 : x.state === "Booted" ? 1 : 2;
+        x.helper ? 0 : x.state === "Booted" ? 1 : x.device === preferredUdid ? 2 : 3;
+      // Newest runtime first, so "iPhone 17 Pro (27.0)" sorts above its 26.x twins.
+      const runtimeRank = (runtime: string): number => {
+        const m = runtime.match(/-(\d+)-(\d+)/);
+        const major = m ? Number(m[1]) : 0;
+        const minor = m ? Number(m[2]) : 0;
+        return -(major * 1000 + minor);
+      };
       devices.sort((a, b) =>
-        familyRank(a.name) - familyRank(b.name) ||
         stateRank(a) - stateRank(b) ||
-        a.name.localeCompare(b.name),
+        familyRank(a.name) - familyRank(b.name) ||
+        a.name.localeCompare(b.name) ||
+        runtimeRank(a.runtime) - runtimeRank(b.runtime),
       );
       res.writeHead(200, {
         "Content-Type": "application/json",
@@ -1248,8 +1362,13 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
         try {
           const bridge = await getInspectWebKitBridge();
           const bridgeTargets = await bridge.listTargets();
-          const wsProtocol = websocketProtocolForRequest(req);
-          const wsTargetBase = `${hostForRequest(req) ?? `127.0.0.1:${bridge.port}`}${devtoolsPrefix}`;
+          // Proxy mode routes the inspector socket through the preview's
+          // same-origin `/devtools` proxy; otherwise the browser talks to the
+          // bridge's loopback port directly (the pre-proxy behavior).
+          const wsProtocol = proxyHelpers ? websocketProtocolForRequest(req) : "ws";
+          const wsTargetBase = proxyHelpers
+            ? `${hostForRequest(req) ?? `127.0.0.1:${bridge.port}`}${devtoolsPrefix}`
+            : `127.0.0.1:${bridge.port}/devtools`;
           // inspect-webkit@0.0.3 only exposes `sim:<webinspectord-pid>` for
           // simulator targets, which can't be reconciled against a sim UDID.
           // Surface every booted sim's targets (Safari Develop-menu behavior)
@@ -1356,8 +1475,8 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
         "Content-Type": "application/json",
         "Cache-Control": "no-store",
       });
-      const remoteState = state ? rewriteStateForRequestHost(state, hostForRequest(req), base) : null;
-      res.end(JSON.stringify(remoteState ? previewConfigForState(remoteState, base, serveSimBinPath(), execToken, !!options?.disableAvcc) : null));
+      const remoteState = state ? rewriteStateForRequestHost(state, hostForRequest(req), base, httpProtocolForRequest(req), proxyHelpers) : null;
+      res.end(JSON.stringify(remoteState ? previewConfigForState(remoteState, base, serveSimBinPath(), execToken, options?.codec, proxyHelpers) : null));
       return;
     }
 
@@ -1369,9 +1488,9 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
       const computeConfig = (): string => {
         const states = readServeSimStates();
         const state = selectServeSimState(states, selectedDevice);
-        const remoteState = state ? rewriteStateForRequestHost(state, hostForRequest(req), base) : null;
+        const remoteState = state ? rewriteStateForRequestHost(state, hostForRequest(req), base, httpProtocolForRequest(req), proxyHelpers) : null;
         return JSON.stringify(
-          remoteState ? previewConfigForState(remoteState, base, serveSimBinPath(), execToken, !!options?.disableAvcc) : null,
+          remoteState ? previewConfigForState(remoteState, base, serveSimBinPath(), execToken, options?.codec, proxyHelpers) : null,
         );
       };
 
@@ -1546,53 +1665,6 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
       return;
     }
 
-    // SSE: simctl log stream
-    if (url === base + "/logs") {
-      const states = readServeSimStates();
-      const state = selectServeSimState(states, selectedDevice);
-      if (!state) {
-        res.writeHead(404);
-        res.end("No serve-sim device");
-        return;
-      }
-      const udid = state.device;
-      res.writeHead(200, {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-        "X-Accel-Buffering": "no",
-      });
-      res.write(":\n\n");
-
-      const child: ChildProcess = spawn("xcrun", [
-        "simctl", "spawn", udid, "log", "stream",
-        "--style", "ndjson",
-        "--level", "info",
-      ], { stdio: ["ignore", "pipe", "ignore"] });
-
-      let buf = "";
-      child.stdout!.on("data", (chunk: Buffer) => {
-        buf += chunk.toString();
-        let nl: number;
-        while ((nl = buf.indexOf("\n")) !== -1) {
-          const line = buf.slice(0, nl).trim();
-          buf = buf.slice(nl + 1);
-          if (line) res.write("data: " + line + "\n\n");
-        }
-        // Drop a runaway partial line so a malformed/never-terminated
-        // log entry can't grow `buf` without bound.
-        if (buf.length > SSE_LINE_BUFFER_LIMIT) buf = "";
-      });
-
-      child.on("error", () => { try { res.end(); } catch {} });
-      child.on("close", () => res.end());
-      req.on("close", () => {
-        child.stdout?.destroy();
-        child.kill();
-      });
-      return;
-    }
-
     // SSE: foreground-app change stream. Emits `{bundleId, pid}` events
     // parsed from SpringBoard's "Setting process visibility to: Foreground"
     // log line. Filtering is done here (not in the browser) so the SSE stream
@@ -1725,13 +1797,18 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
     }
     socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
   };
+  // WebSocket exec channel — same auth/origin policy as POST /exec, but off
+  // the browser's per-origin HTTP connection pool so multiple preview tabs
+  // (each holding MJPEG + SSE streams) can't starve exec actions. Servers
+  // mounting this middleware should forward `upgrade` events here (the
+  // built-in preview server does); the client falls back to POST /exec when
+  // the upgrade never completes.
   const handleExecUpgrade = createExecUpgradeHandler({
     path: `${base}/exec-ws`,
     execToken,
     ssePrefixes: [
       `${base}/api/events`,
       `${base}/appstate`,
-      `${base}/logs`,
       `${base}/ax`,
     ],
     onUiRequest: handleUiRequest,
