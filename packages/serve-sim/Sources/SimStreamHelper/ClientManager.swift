@@ -1,11 +1,26 @@
 import Foundation
-import Swifter
+import HummingbirdWebSocket
+import NIOCore
+
+enum ClientEvent: Sendable {
+    case touch(TouchEventPayload)
+    case button(ButtonEventPayload)
+    case multiTouch(MultiTouchEventPayload)
+    case key(KeyEventPayload)
+    case orientation(value: UInt32, name: String)
+    case caDebug(CADebugEventPayload)
+    case memoryWarning
+    case digitalCrown(DigitalCrownEventPayload)
+    case scroll(ScrollEventPayload)
+    case avccClientConnected
+}
 
 /// Manages WebSocket clients for input and MJPEG stream clients for video.
-final class ClientManager {
-    private var wsSessions: [ObjectIdentifier: WebSocketSession] = [:]
-    private let queue = DispatchQueue(label: "client-manager")
-    private let configLock = NSLock()
+actor ClientManager {
+    nonisolated let events: AsyncStream<ClientEvent>
+
+    private let eventContinuation: AsyncStream<ClientEvent>.Continuation
+    private var wsSessions: [Int: InputWebSocketSession] = [:]
 
     private var screenWidth = 0
     private var screenHeight = 0
@@ -13,54 +28,37 @@ final class ClientManager {
 
     /// Latest JPEG frame data, replaced on each new frame
     private var latestFrame: Data?
-    private var mjpegClients: [ObjectIdentifier: MJPEGClient] = [:]
+    private var mjpegClients: [Int: MJPEGClient] = [:]
     private var nextClientId = 0
 
     /// AVCC (H.264) stream clients + the cached avcC description envelope so
     /// late joiners can configure their decoder without waiting for the next
     /// natural IDR.
-    private var avccClients: [ObjectIdentifier: AVCCClient] = [:]
+    private var avccClients: [Int: AVCCClient] = [:]
     private var cachedAvccDescription: Data?
-    /// Fired when an AVCC client connects so the owner can force a keyframe —
-    /// the new decoder needs an IDR before any delta will decode.
-    var onAvccClientConnect: (() -> Void)?
+    private var avccClientCount = 0
 
-    var onTouch: ((TouchEventPayload) -> Void)?
-    var onButton: ((String) -> Void)?
-    /// Arbitrary HID hardware button by (page, usage, phase) — power / volume /
-    /// action / side button, etc. Carried from DeviceKit chrome.json.
-    var onButtonHID: ((_ page: UInt32, _ usage: UInt32, _ phase: String) -> Void)?
-    var onMultiTouch: ((MultiTouchEventPayload) -> Void)?
-    var onKey: ((KeyEventPayload) -> Void)?
-    var onOrientation: ((UInt32) -> Bool)?
-    var onCADebug: ((CADebugEventPayload) -> Void)?
-    var onMemoryWarning: (() -> Void)?
-    var onDigitalCrown: ((DigitalCrownEventPayload) -> Void)?
-    var onScroll: ((ScrollEventPayload) -> Void)?
+    init() {
+        (events, eventContinuation) = AsyncStream.makeStream(of: ClientEvent.self)
+    }
 
     // MARK: - Configuration
 
-    func setScreenSize(width: Int, height: Int) {
-        configLock.lock()
+    func setScreenSize(width: Int, height: Int) async {
         let changed = width != screenWidth || height != screenHeight
         screenWidth = width
         screenHeight = height
-        configLock.unlock()
-        if changed { broadcastConfig() }
+        if changed { await broadcastConfig() }
     }
 
-    private func setScreenOrientation(_ orientation: String) {
-        configLock.lock()
+    func setScreenOrientation(_ orientation: String) async {
         let changed = orientation != screenOrientation
         screenOrientation = orientation
-        configLock.unlock()
-        if changed { broadcastConfig() }
+        if changed { await broadcastConfig() }
     }
 
     func screenConfig() -> [String: Any] {
-        configLock.lock()
-        defer { configLock.unlock() }
-        return [
+        [
             "width": screenWidth,
             "height": screenHeight,
             "orientation": screenOrientation,
@@ -68,7 +66,7 @@ final class ClientManager {
     }
 
     /// Tag for a server->client screen-config push. Distinct from the
-    /// client->server input tags (0x03–0x0A); the frame layout mirrors input:
+    /// client->server input tags (0x03-0x0A); the frame layout mirrors input:
     /// `[tag][JSON payload]`.
     private static let wsMsgConfig: UInt8 = 0x82
 
@@ -80,12 +78,10 @@ final class ClientManager {
     /// Push the current screen config to every connected input WebSocket. This
     /// replaces the browser's old 1s `/config` poll — clients now receive
     /// dimensions/orientation over the socket they already hold open for input.
-    func broadcastConfig() {
+    func broadcastConfig() async {
         guard let frame = configFrame() else { return }
-        queue.async {
-            for (_, session) in self.wsSessions {
-                session.writeBinary(frame)
-            }
+        for session in wsSessions.values {
+            await session.writeBinary(Data(frame))
         }
     }
 
@@ -94,29 +90,22 @@ final class ClientManager {
     func addMJPEGClient() -> MJPEGClient {
         let client = MJPEGClient(id: nextClientId)
         nextClientId += 1
-        let key = ObjectIdentifier(client)
-        queue.async {
-            self.mjpegClients[key] = client
-            print("[clients] MJPEG client connected (\(self.mjpegClients.count) total)")
-        }
+        mjpegClients[client.id] = client
+        print("[clients] MJPEG client connected (\(mjpegClients.count) total)")
         return client
     }
 
     /// Send the latest cached frame to a client (call after writer is attached).
     func sendLatestFrame(to client: MJPEGClient) {
-        queue.async {
-            if let frame = self.latestFrame {
-                client.send(frame: frame)
-            }
+        if let frame = latestFrame {
+            client.send(frame: frame)
         }
     }
 
     func removeMJPEGClient(_ client: MJPEGClient) {
-        let key = ObjectIdentifier(client)
-        queue.async {
-            self.mjpegClients.removeValue(forKey: key)
-            print("[clients] MJPEG client disconnected (\(self.mjpegClients.count) total)")
-        }
+        mjpegClients.removeValue(forKey: client.id)
+        client.close()
+        print("[clients] MJPEG client disconnected (\(mjpegClients.count) total)")
     }
 
     // MARK: - AVCC Client Management
@@ -125,21 +114,15 @@ final class ClientManager {
     /// gates VideoToolbox encoding on this so an all-MJPEG session pays no
     /// H.264 cost.
     func hasAvccClients() -> Bool {
-        configLock.lock()
-        defer { configLock.unlock() }
-        return avccClientCount > 0
+        avccClientCount > 0
     }
-    private var avccClientCount = 0
 
     func addAvccClient() -> AVCCClient {
         let client = AVCCClient(id: nextClientId)
         nextClientId += 1
-        let key = ObjectIdentifier(client)
-        configLock.lock(); avccClientCount += 1; configLock.unlock()
-        queue.async {
-            self.avccClients[key] = client
-            print("[clients] AVCC client connected (\(self.avccClients.count) total)")
-        }
+        avccClientCount += 1
+        avccClients[client.id] = client
+        print("[clients] AVCC client connected (\(avccClients.count) total)")
         return client
     }
 
@@ -147,81 +130,68 @@ final class ClientManager {
     /// replay the cached decoder description, then ask the owner to force a
     /// keyframe so an IDR follows promptly.
     func sendInitialAvcc(to client: AVCCClient) {
-        queue.async {
-            if let jpeg = self.latestFrame {
-                client.send(AVCCEnvelope.seed(jpeg: jpeg))
-            }
-            if let desc = self.cachedAvccDescription {
-                client.send(desc)
-            }
+        let data = (latestFrame ?? Data()) + (cachedAvccDescription ?? Data())
+        if !data.isEmpty {
+            client.send(data)
         }
-        onAvccClientConnect?()
+        eventContinuation.yield(.avccClientConnected)
     }
 
     func removeAvccClient(_ client: AVCCClient) {
-        let key = ObjectIdentifier(client)
-        configLock.lock(); avccClientCount = max(0, avccClientCount - 1); configLock.unlock()
-        queue.async {
-            self.avccClients.removeValue(forKey: key)
-            print("[clients] AVCC client disconnected (\(self.avccClients.count) total)")
-        }
+        avccClientCount = max(0, avccClientCount - 1)
+        avccClients.removeValue(forKey: client.id)
+        client.close()
+        print("[clients] AVCC client disconnected (\(avccClients.count) total)")
     }
 
     /// Broadcast one enveloped AVCC chunk. Caches the description so it can be
     /// replayed to clients that connect after it was first emitted.
     func broadcastAvcc(_ envelope: Data, isDescription: Bool = false) {
-        queue.async {
-            if isDescription { self.cachedAvccDescription = envelope }
-            for (_, client) in self.avccClients {
-                client.send(envelope)
-            }
+        if isDescription { cachedAvccDescription = envelope }
+        for client in avccClients.values {
+            client.send(envelope)
         }
     }
 
     // MARK: - WebSocket Client Management (input only)
 
-    func addWSClient(_ session: WebSocketSession) {
-        let id = ObjectIdentifier(session)
-        let frame = configFrame()
-        queue.async {
-            self.wsSessions[id] = session
-            // Seed the new client with the current screen config so it gets
-            // dimensions/orientation immediately, replacing the old 1s poll.
-            if let frame = frame { session.writeBinary(frame) }
-            print("[clients] WS input client connected (\(self.wsSessions.count) total)")
+    func addWSClient(outbound: WebSocketOutboundWriter) async -> InputWebSocketSession {
+        let id = nextClientId
+        nextClientId += 1
+        let session = InputWebSocketSession(id: id, outbound: outbound)
+        wsSessions[id] = session
+        // Seed the new client with the current screen config so it gets
+        // dimensions/orientation immediately, replacing the old 1s poll.
+        if let frame = configFrame() {
+            await session.writeBinary(Data(frame))
         }
+        print("[clients] WS input client connected (\(wsSessions.count) total)")
+        return session
     }
 
-    func removeWSClient(_ session: WebSocketSession) {
-        let id = ObjectIdentifier(session)
-        queue.async {
-            self.wsSessions.removeValue(forKey: id)
-            print("[clients] WS input client disconnected (\(self.wsSessions.count) total)")
-        }
+    func removeWSClient(_ session: InputWebSocketSession) {
+        wsSessions.removeValue(forKey: session.id)
+        print("[clients] WS input client disconnected (\(wsSessions.count) total)")
     }
 
     // MARK: - Message Handling
 
-    func handleMessage(from session: WebSocketSession, data: Data) {
+    func handleMessage(from session: InputWebSocketSession, data: Data) {
         guard data.count >= 1 else { return }
         let type = data[0]
 
         if type == 0x03 { // WS_MSG_TOUCH
             guard let json = try? JSONDecoder().decode(TouchEventPayload.self, from: data[1...]) else { return }
-            onTouch?(json)
+            eventContinuation.yield(.touch(json))
         } else if type == 0x04 { // WS_MSG_BUTTON
             guard let json = try? JSONDecoder().decode(ButtonEventPayload.self, from: data[1...]) else { return }
-            if let page = json.page, let usage = json.usage {
-                onButtonHID?(page, usage, json.phase ?? "press")
-            } else {
-                onButton?(json.button)
-            }
+            eventContinuation.yield(.button(json))
         } else if type == 0x05 { // WS_MSG_MULTI_TOUCH
             guard let json = try? JSONDecoder().decode(MultiTouchEventPayload.self, from: data[1...]) else { return }
-            onMultiTouch?(json)
+            eventContinuation.yield(.multiTouch(json))
         } else if type == 0x06 { // WS_MSG_KEY
             guard let json = try? JSONDecoder().decode(KeyEventPayload.self, from: data[1...]) else { return }
-            onKey?(json)
+            eventContinuation.yield(.key(json))
         } else if type == 0x07 { // WS_MSG_ORIENTATION
             guard let json = try? JSONDecoder().decode(OrientationEventPayload.self, from: data[1...]) else { return }
             let value: UInt32
@@ -234,104 +204,106 @@ final class ClientManager {
                 print("[clients] Unknown orientation: \(json.orientation)")
                 return
             }
-            if onOrientation?(value) == true {
-                setScreenOrientation(json.orientation)
-            } else {
-                print("[clients] Orientation request failed: \(json.orientation)")
-            }
+            eventContinuation.yield(.orientation(value: value, name: json.orientation))
         } else if type == 0x08 { // WS_MSG_CA_DEBUG
             guard let json = try? JSONDecoder().decode(CADebugEventPayload.self, from: data[1...]) else { return }
-            onCADebug?(json)
+            eventContinuation.yield(.caDebug(json))
         } else if type == 0x09 { // WS_MSG_MEMORY_WARNING
-            onMemoryWarning?()
+            eventContinuation.yield(.memoryWarning)
         } else if type == 0x0A { // WS_MSG_DIGITAL_CROWN
             guard let json = try? JSONDecoder().decode(DigitalCrownEventPayload.self, from: data[1...]) else { return }
-            onDigitalCrown?(json)
+            eventContinuation.yield(.digitalCrown(json))
         } else if type == 0x0B { // WS_MSG_SCROLL
             guard let json = try? JSONDecoder().decode(ScrollEventPayload.self, from: data[1...]) else { return }
-            onScroll?(json)
+            eventContinuation.yield(.scroll(json))
         }
     }
 
     // MARK: - Frame Broadcasting
 
     func broadcastFrame(jpegData: Data) {
-        queue.async {
-            self.latestFrame = jpegData
-            guard !self.mjpegClients.isEmpty else { return }
-            for (_, client) in self.mjpegClients {
-                client.send(frame: jpegData)
-            }
+        latestFrame = jpegData
+        guard !mjpegClients.isEmpty else { return }
+        for client in mjpegClients.values {
+            client.send(frame: jpegData)
         }
     }
 
     func stop() {
-        queue.async {
-            for (_, client) in self.mjpegClients {
-                client.close()
-            }
-            for (_, client) in self.avccClients {
-                client.close()
-            }
-            self.mjpegClients.removeAll()
-            self.avccClients.removeAll()
-            self.wsSessions.removeAll()
+        for client in mjpegClients.values {
+            client.close()
         }
-        configLock.lock(); avccClientCount = 0; configLock.unlock()
+        for client in avccClients.values {
+            client.close()
+        }
+        mjpegClients.removeAll()
+        avccClients.removeAll()
+        wsSessions.removeAll()
+        avccClientCount = 0
+        eventContinuation.finish()
+    }
+}
+
+/// Thin adapter around Hummingbird's async WebSocket writer.
+struct InputWebSocketSession: Sendable {
+    let id: Int
+    private let outbound: WebSocketOutboundWriter
+
+    init(id: Int, outbound: WebSocketOutboundWriter) {
+        self.id = id
+        self.outbound = outbound
+    }
+
+    func writeBinary(_ data: Data) async {
+        var buffer = ByteBufferAllocator().buffer(capacity: data.count)
+        buffer.writeBytes(data)
+        try? await outbound.write(.binary(buffer))
     }
 }
 
 /// A single AVCC streaming client. Unlike `MJPEGClient`, chunks already carry
 /// their own length-prefixed envelope, so the writer just forwards raw bytes.
-final class AVCCClient {
+struct AVCCClient: Sendable {
     let id: Int
-    private var writer: ((Data) -> Bool)?
-    private var closed = false
+    let chunks: AsyncStream<Data>
+    private let continuation: AsyncStream<Data>.Continuation
 
-    init(id: Int) { self.id = id }
-
-    func setWriter(_ writer: @escaping (Data) -> Bool) { self.writer = writer }
+    init(id: Int) {
+        self.id = id
+        (chunks, continuation) = AsyncStream.makeStream(of: Data.self, bufferingPolicy: .bufferingNewest(1))
+    }
 
     func send(_ chunk: Data) {
-        guard !closed, let writer = writer else { return }
-        if !writer(chunk) { closed = true }
+        continuation.yield(chunk)
     }
 
     func close() {
-        closed = true
-        writer = nil
+        continuation.finish()
     }
 }
 
 /// Represents a single MJPEG streaming client with a continuation-based writer.
-final class MJPEGClient {
+struct MJPEGClient: Sendable {
     let id: Int
-    private var writer: ((Data) -> Bool)?
+    let chunks: AsyncStream<Data>
+    private let continuation: AsyncStream<Data>.Continuation
     private let boundary = "frame"
-    private var closed = false
 
     init(id: Int) {
         self.id = id
-    }
-
-    func setWriter(_ writer: @escaping (Data) -> Bool) {
-        self.writer = writer
+        (chunks, continuation) = AsyncStream.makeStream(of: Data.self, bufferingPolicy: .bufferingNewest(1))
     }
 
     func send(frame jpegData: Data) {
-        guard !closed, let writer = writer else { return }
         var chunk = Data()
         let header = "--\(boundary)\r\nContent-Type: image/jpeg\r\nContent-Length: \(jpegData.count)\r\n\r\n"
         chunk.append(Data(header.utf8))
         chunk.append(jpegData)
         chunk.append(Data("\r\n".utf8))
-        if !writer(chunk) {
-            closed = true
-        }
+        continuation.yield(chunk)
     }
 
     func close() {
-        closed = true
-        writer = nil
+        continuation.finish()
     }
 }

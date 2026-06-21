@@ -17,7 +17,7 @@ let args = CommandLine.arguments
 // session. Usage: serve-sim-bin --capture-scroll <udid> [seconds]
 if args.count >= 3, args[1] == "--capture-scroll" {
     let secs = args.count >= 4 ? (Double(args[3]) ?? 20) : 20
-    CaptureScroll.run(udid: args[2], seconds: secs)
+    try await CaptureScroll.run(udid: args[2], seconds: secs)
     // CaptureScroll.run calls exit(); this is unreachable.
 }
 
@@ -44,6 +44,8 @@ let frameCapture = FrameCapture()
 let videoEncoder = VideoEncoder(quality: 0.7)
 let h264Encoder = H264Encoder(fps: 60)
 let hidInjector = HIDInjector()
+private let screenState = ScreenState()
+private let startup = StartupSignal()
 let encodeQueue = DispatchQueue(label: "encode", qos: .userInteractive)
 let h264Queue = DispatchQueue(label: "encode.h264", qos: .userInteractive)
 
@@ -58,17 +60,14 @@ var forceKeyframe = false
 
 // H.264 output → AVCC envelope → broadcast to /stream.avcc clients.
 h264Encoder.onEncoded = { encoded in
-    if let description = encoded.description {
-        httpServer.clientManager.broadcastAvcc(AVCCEnvelope.description(avcc: description), isDescription: true)
-    }
-    switch encoded.kind {
-    case .keyframe: httpServer.clientManager.broadcastAvcc(AVCCEnvelope.keyframe(avcc: encoded.avcc))
-    case .delta: httpServer.clientManager.broadcastAvcc(AVCCEnvelope.delta(avcc: encoded.avcc))
-    }
-}
-httpServer.clientManager.onAvccClientConnect = {
-    h264Queue.async {
-        forceKeyframe = true
+    Task {
+        if let description = encoded.description {
+            await httpServer.clientManager.broadcastAvcc(AVCCEnvelope.description(avcc: description), isDescription: true)
+        }
+        switch encoded.kind {
+        case .keyframe: await httpServer.clientManager.broadcastAvcc(AVCCEnvelope.keyframe(avcc: encoded.avcc))
+        case .delta: await httpServer.clientManager.broadcastAvcc(AVCCEnvelope.delta(avcc: encoded.avcc))
+        }
     }
 }
 
@@ -79,52 +78,83 @@ do {
     print("[main] Warning: HID setup failed: \(error.localizedDescription)")
 }
 
-// Wire client manager → HID injector
-httpServer.clientManager.onTouch = { touch in
-    hidInjector.sendTouch(type: touch.type, x: touch.x, y: touch.y,
-                          screenWidth: screenWidth, screenHeight: screenHeight,
-                          edge: touch.edge ?? 0)
+let clientEventsTask = Task {
+    for await event in clientManager.events {
+        switch event {
+        case .touch(let touch):
+            let size = await screenState.size()
+            hidInjector.sendTouch(type: touch.type, x: touch.x, y: touch.y,
+                                    screenWidth: size.width, screenHeight: size.height,
+                                    edge: touch.edge ?? 0)
+
+        case .button(let button):
+            if let page = button.page, let usage = button.usage {
+                hidInjector.sendButtonHID(page: page, usage: usage, phase: button.phase ?? "press")
+            } else {
+                hidInjector.sendButton(button: button.button, deviceUDID: deviceUDID)
+            }
+
+        case .multiTouch(let multiTouch):
+            let size = await screenState.size()
+            hidInjector.sendMultiTouch(type: multiTouch.type,
+                                        x1: multiTouch.x1, y1: multiTouch.y1,
+                                        x2: multiTouch.x2, y2: multiTouch.y2,
+                                        screenWidth: size.width, screenHeight: size.height)
+
+        case .key(let key):
+            hidInjector.sendKey(type: key.type, usage: key.usage)
+
+        case .orientation(let value, let name):
+            if hidInjector.sendOrientation(orientation: value) {
+                await clientManager.setScreenOrientation(name)
+            } else {
+                print("[clients] Orientation request failed: \(name)")
+            }
+
+        case .caDebug(let payload):
+            _ = hidInjector.setCADebugOption(name: payload.option, enabled: payload.enabled)
+
+        case .memoryWarning:
+            hidInjector.simulateMemoryWarning()
+
+        case .digitalCrown(let payload):
+            hidInjector.sendDigitalCrown(delta: payload.delta)
+
+        case .scroll(let payload):
+            let size = await screenState.size()
+            // Payload deltas are a fraction of the display; scale to device pixels.
+            hidInjector.sendScroll(dx: payload.dx * Double(size.width),
+                                    dy: payload.dy * Double(size.height),
+                                    anchorX: payload.x, anchorY: payload.y,
+                                    screenWidth: size.width, screenHeight: size.height)
+
+        case .avccClientConnected:
+            h264Queue.async {
+                requestKeyframe()
+            }
+        }
+    }
 }
-httpServer.clientManager.onButton = { button in
-    hidInjector.sendButton(button: button, deviceUDID: deviceUDID)
-}
-httpServer.clientManager.onButtonHID = { page, usage, phase in
-    hidInjector.sendButtonHID(page: page, usage: usage, phase: phase)
-}
-httpServer.clientManager.onMultiTouch = { multiTouch in
-    hidInjector.sendMultiTouch(type: multiTouch.type,
-                               x1: multiTouch.x1, y1: multiTouch.y1,
-                               x2: multiTouch.x2, y2: multiTouch.y2,
-                               screenWidth: screenWidth, screenHeight: screenHeight)
-}
-httpServer.clientManager.onKey = { key in
-    hidInjector.sendKey(type: key.type, usage: key.usage)
-}
-httpServer.clientManager.onOrientation = { orientation in
-    hidInjector.sendOrientation(orientation: orientation)
-}
-httpServer.clientManager.onCADebug = { payload in
-    _ = hidInjector.setCADebugOption(name: payload.option, enabled: payload.enabled)
-}
-httpServer.clientManager.onMemoryWarning = {
-    hidInjector.simulateMemoryWarning()
-}
-httpServer.clientManager.onDigitalCrown = { payload in
-    hidInjector.sendDigitalCrown(delta: payload.delta)
-}
-httpServer.clientManager.onScroll = { payload in
-    // Payload deltas are a fraction of the display; scale to device pixels.
-    hidInjector.sendScroll(dx: payload.dx * Double(screenWidth),
-                           dy: payload.dy * Double(screenHeight),
-                           anchorX: payload.x, anchorY: payload.y,
-                           screenWidth: screenWidth, screenHeight: screenHeight)
+
+let serverTask = Task {
+    do {
+        try await httpServer.run {
+            await startup.succeed()
+        }
+    } catch is CancellationError {
+        // Normal shutdown.
+    } catch {
+        await startup.fail(error)
+        throw error
+    }
 }
 
 // Start HTTP + WebSocket server
 do {
-    try httpServer.start()
+    try await startup.wait()
 } catch {
     print("[main] Failed to start server: \(error.localizedDescription)")
+    clientEventsTask.cancel()
     exit(1)
 }
 
@@ -147,29 +177,36 @@ let frameHandler: (CVPixelBuffer, CMTime) -> Void = { pixelBuffer, timestamp in
             height: Int32(h),
             fps: 60,
             onEncodedFrame: { jpegData in
-                httpServer.clientManager.broadcastFrame(jpegData: jpegData)
+                Task {
+                    await httpServer.clientManager.broadcastFrame(jpegData: jpegData)
+                }
             }
         )
         encoderReady = true
 
         // Update client manager config
-        httpServer.clientManager.setScreenSize(width: w, height: h)
+        Task {
+            await screenState.set(width: w, height: h)
+            await httpServer.clientManager.setScreenSize(width: w, height: h)
+        }
     }
 
     if encoderReady, !encoding {
         // Backpressure: skip frame if encoder is still working on the previous one
         encoding = true
-        encodeQueue.async {
+        let workItem = DispatchWorkItem {
             videoEncoder.encode(pixelBuffer: pixelBuffer)
             encoding = false
         }
+        encodeQueue.async(execute: workItem)
     }
 
     // H.264 path runs only while at least one AVCC viewer is connected, so an
     // all-MJPEG session pays no VideoToolbox cost. Its own backpressure flag
     // lets it skip independently of the JPEG encoder.
-    if httpServer.clientManager.hasAvccClients() {
-        h264Queue.async {
+    Task {
+        guard await httpServer.clientManager.hasAvccClients() else { return }
+        let workItem = DispatchWorkItem {
             if h264Encoding { return }
             h264Encoding = true
             let force = forceKeyframe
@@ -180,6 +217,7 @@ let frameHandler: (CVPixelBuffer, CMTime) -> Void = { pixelBuffer, timestamp in
                 }
             }
         }
+        h264Queue.async(execute: workItem)
     }
 }
 
@@ -190,25 +228,104 @@ do {
     print("Press Ctrl+C to stop.\n")
 } catch {
     print("[main] Failed to start capture: \(error.localizedDescription)")
+    clientEventsTask.cancel()
+    serverTask.cancel()
+    await httpServer.clientManager.stop()
     exit(1)
 }
 
-// Shutdown handlers
-signal(SIGINT) { _ in
-    print("\n[main] Shutting down...")
-    frameCapture.stop()
-    videoEncoder.stop()
-    h264Encoder.stop()
-    httpServer.stop()
-    exit(0)
+await waitForTerminationSignal()
+
+print("\n[main] Shutting down...")
+frameCapture.stop()
+videoEncoder.stop()
+h264Encoder.stop()
+await httpServer.clientManager.stop()
+clientEventsTask.cancel()
+serverTask.cancel()
+_ = try? await serverTask.value
+
+private func waitForTerminationSignal() async {
+    await withCheckedContinuation { continuation in
+        signal(SIGINT, SIG_IGN)
+        signal(SIGTERM, SIG_IGN)
+
+        let sigint = DispatchSource.makeSignalSource(signal: SIGINT)
+        let sigterm = DispatchSource.makeSignalSource(signal: SIGTERM)
+        let state = SignalContinuation(continuation: continuation, sources: [sigint, sigterm])
+
+        sigint.setEventHandler {
+            Task { await state.resume() }
+        }
+        sigterm.setEventHandler {
+            Task { await state.resume() }
+        }
+
+        sigint.resume()
+        sigterm.resume()
+    }
 }
 
-signal(SIGTERM) { _ in
-    frameCapture.stop()
-    videoEncoder.stop()
-    h264Encoder.stop()
-    httpServer.stop()
-    exit(0)
+private actor StartupSignal {
+    private var continuation: CheckedContinuation<Void, Error>?
+    private var result: Result<Void, Error>?
+
+    func wait() async throws {
+        if let result {
+            try result.get()
+            return
+        }
+
+        try await withCheckedThrowingContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+
+    func succeed() {
+        complete(.success(()))
+    }
+
+    func fail(_ error: Error) {
+        complete(.failure(error))
+    }
+
+    private func complete(_ result: Result<Void, Error>) {
+        guard self.result == nil else { return }
+        self.result = result
+        continuation?.resume(with: result)
+        continuation = nil
+    }
 }
 
-RunLoop.main.run()
+private actor ScreenState {
+    private var width = 0
+    private var height = 0
+
+    func set(width: Int, height: Int) {
+        self.width = width
+        self.height = height
+    }
+
+    func size() -> (width: Int, height: Int) {
+        (width, height)
+    }
+}
+
+private actor SignalContinuation {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private let sources: [DispatchSourceSignal]
+
+    init(continuation: CheckedContinuation<Void, Never>, sources: [DispatchSourceSignal]) {
+        self.continuation = continuation
+        self.sources = sources
+    }
+
+    func resume() {
+        guard let continuation else { return }
+        self.continuation = nil
+        for source in sources {
+            source.cancel()
+        }
+        continuation.resume()
+    }
+}

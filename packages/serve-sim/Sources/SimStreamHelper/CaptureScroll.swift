@@ -9,7 +9,7 @@ import AppKit
 ///
 /// Usage: serve-sim-bin --capture-scroll <udid> [seconds]
 enum CaptureScroll {
-    static func run(udid: String, seconds: Double) {
+    static func run(udid: String, seconds: Double) async throws -> Never {
         SimFrameworks.load()
         guard let device = FrameCapture.findSimDevice(udid: udid) else {
             fputs("[capture] device \(udid) not found\n", stderr)
@@ -51,13 +51,12 @@ enum CaptureScroll {
             exit(1)
         }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) {
-            let stopSel = NSSelectorFromString("stopCaptureSession")
-            _ = mgr.perform(stopSel)
-            print("[capture] capture stopped; \(messageCount) messages logged.")
-            exit(0)
-        }
-        CFRunLoopRun()
+        try? await Task.sleep(for: .seconds(seconds))
+
+        let stopSel = NSSelectorFromString("stopCaptureSession")
+        _ = mgr.perform(stopSel)
+        print("[capture] capture stopped; \(messageCount) messages logged.")
+        exit(0)
     }
 
     static var messageCount = 0

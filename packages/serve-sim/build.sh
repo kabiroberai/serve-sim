@@ -13,6 +13,7 @@ BIN_DIR="$(swift build "${SWIFT_BUILD_ARGS[@]}" --show-bin-path)"
 
 mkdir -p bin
 cp "$BIN_DIR/serve-sim-bin" bin/serve-sim-bin
+strip bin/serve-sim-bin
 
 # Re-sign after copy (required for framework linking)
 codesign -s - -f bin/serve-sim-bin 2>/dev/null
