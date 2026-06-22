@@ -32,7 +32,7 @@
         "commander": "^14.0.1",
         "debug": "^4.4.3",
         "lucide-react": "^1.20.0",
-        "node-swift": "1.4.0",
+        "node-swift": "1.5.1",
         "preact": "^10.29.1",
         "react": "^19.0.0",
         "react-dom": "^19.0.0",
@@ -348,7 +348,7 @@
 
     "node-liblzma": ["node-liblzma@2.2.0", "", { "dependencies": { "node-addon-api": "^8.5.0", "node-gyp-build": "^4.8.4" }, "bin": { "nxz": "lib/cli/nxz.js" } }, "sha512-s0KzNOWwOJJgPG6wxg6cKohnAl9Wk/oW1KrQaVzJBjQwVcUGPQCzpR46Ximygjqj/3KhOrtJXnYMp/xYAXp75g=="],
 
-    "node-swift": ["node-swift@1.4.0", "", { "dependencies": { "import-cwd": "^3.0.0" }, "bin": { "node-swift": "lib/cli.js" } }, "sha512-9dt3vTTOzc+bPTc5YVipWxg5WvfOk/rq4uanSXQnjMvwOd4FVJ0cOlW7WBhNO7I86wU3rQaZLGHKhfMm4sYyaA=="],
+    "node-swift": ["node-swift@1.5.1", "", { "dependencies": { "import-cwd": "^3.0.0" }, "bin": { "node-swift": "lib/cli.js" } }, "sha512-bA4+HeSihdKIyyBFx+X5FFS5Nby6QI+O7KsLs14J/EkcrN88RZKjfPY/uXaeSY6k4tEB60Hu2mH4D/ZMgwCXbQ=="],
 
     "once": ["once@1.4.0", "", { "dependencies": { "wrappy": "1" } }, "sha512-lNaJgI+2Q5URQBkccEKHTQOPaXdUxnZZElQTZY0MFUAuaEqe1E+Nyvgdz/aIyNi6Z9MzO5dv1H8n58/GELp3+w=="],
 
