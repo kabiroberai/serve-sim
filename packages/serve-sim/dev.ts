@@ -201,8 +201,8 @@ function scheduleWatchedBuild() {
 
 // ─── HTML shell ───
 
-function buildHtml(selectedDevice?: string | null): string {
-  const state = selectServeSimState(readServeSimStates(), selectedDevice);
+async function buildHtml(selectedDevice?: string | null): Promise<string> {
+  const state = selectServeSimState(await readServeSimStates(), selectedDevice);
   // Even with no helper attached the page polls the host (list/boot devices)
   // and streams `/api/events` over the control socket, so it always needs the
   // basePath + exec token.
@@ -251,14 +251,14 @@ function handleDevReload(req: IncomingMessage, res: ServerResponse): void {
 // Dev-only routes intercept first; everything else falls through to the
 // production middleware — including `/grid/api/start`, which now boots + serves
 // the device in-process (no spawned helper), so no dev override is needed.
-function devMiddleware(req: IncomingMessage, res: ServerResponse, next: () => void): void {
+async function devMiddleware(req: IncomingMessage, res: ServerResponse, next: () => Promise<void>): Promise<void> {
   const path = (req.url ?? "").split("?")[0];
 
   if (path === "/__dev/reload") return handleDevReload(req, res);
   if (path === "/" || path === "") {
     const device = new URLSearchParams((req.url ?? "").split("?")[1] ?? "").get("device");
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
-    res.end(buildHtml(device));
+    res.end(await buildHtml(device));
     return;
   }
 

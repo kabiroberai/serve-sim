@@ -27,7 +27,10 @@ private func hidLog(_ message: @autoclosure () -> String) {
 /// Apple's Simulator.app always passes NSSize(1.0, 1.0), making ratio = point / 1.0 = point.
 /// The edge parameter (x4) controls whether iOS treats the touch as a system edge gesture
 /// (e.g. bottom edge = swipe-to-home on Face ID devices).
-final class HIDInjector {
+actor HIDInjector {
+    let queue = DispatchSerialQueue(label: "hid-injector", qos: .userInteractive)
+    nonisolated var unownedExecutor: UnownedSerialExecutor { queue.asUnownedSerialExecutor() }
+
     private var hidClient: NSObject?
     private var sendSel: Selector?
     private var simDevice: NSObject?
@@ -146,13 +149,6 @@ final class HIDInjector {
     static let edgeLeft: UInt32   = 1  // Left edge
     static let edgeRight: UInt32  = 4  // Right edge
 
-    // All HID sends funnel through this one serial queue so concurrent input
-    // gestures (a scroll drag, a user touch, a button press) can never interleave
-    // their messages to the shared `hidClient`. One-shot events dispatch a single
-    // `rawSend`; multi-step gestures (scroll, swipe-home, multi-press buttons) run
-    // their whole sequence in one block using the synchronous helpers below.
-    private let inputQueue = DispatchQueue(label: "hid-input")
-
     /// Synchronously hand an already-built Indigo message to the guest, freeing it.
     /// Must run on `inputQueue`.
     private func rawSend(_ msg: UnsafeMutableRawPointer) {
@@ -188,7 +184,7 @@ final class HIDInjector {
     func sendTouch(type: String, x: Double, y: Double, screenWidth: Int, screenHeight: Int, edge: UInt32 = 0) {
         guard let msg = touchMessage(type: type, x: x, y: y, edge: edge) else { return }
         hidLog("[hid] Sending \(type) at (\(String(format:"%.3f",x)),\(String(format:"%.3f",y)))\(edge > 0 ? " edge=\(edge)" : "")")
-        inputQueue.async { [self] in rawSend(msg) }
+        rawSend(msg)
     }
 
     func sendMultiTouch(type: String, x1: Double, y1: Double, x2: Double, y2: Double, screenWidth: Int, screenHeight: Int) {
@@ -210,7 +206,7 @@ final class HIDInjector {
         }
 
         hidLog("[hid] Multi-touch \(type) f1=(\(String(format:"%.3f",x1)),\(String(format:"%.3f",y1))) f2=(\(String(format:"%.3f",x2)),\(String(format:"%.3f",y2)))")
-        inputQueue.async { [self] in rawSend(rawMsg) }
+        rawSend(rawMsg)
     }
 
     // MARK: - Button events
@@ -270,7 +266,7 @@ final class HIDInjector {
         }
 
         hidLog("[hid] Key \(type) usage=0x\(String(usage, radix: 16))")
-        inputQueue.async { [self] in rawSend(msg) }
+        rawSend(msg)
     }
 
     // MARK: - Digital Crown events
@@ -290,7 +286,7 @@ final class HIDInjector {
         }
 
         hidLog("[hid] Digital Crown delta=\(String(format:"%.4f", delta))")
-        inputQueue.async { [self] in rawSend(msg) }
+        rawSend(msg)
     }
 
     // MARK: - Scroll events
@@ -339,7 +335,7 @@ final class HIDInjector {
     ///   - dy: Vertical scroll delta in device pixels (positive = content down).
     ///   - anchorX/anchorY: Normalized (0–1) cursor position to begin the drag
     ///     under, so iOS pans the view beneath the pointer. Nil = screen center.
-    func sendScroll(dx: Double, dy: Double, anchorX: Double?, anchorY: Double?, screenWidth: Int, screenHeight: Int) {
+    func sendScroll(dx: Double, dy: Double, anchorX: Double?, anchorY: Double?, screenWidth: Int, screenHeight: Int) async {
         guard dx.isFinite, dy.isFinite, (dx != 0 || dy != 0), screenWidth > 0, screenHeight > 0 else { return }
 
         // Finger moves opposite to content: scrolling content down = swipe up.
@@ -348,47 +344,47 @@ final class HIDInjector {
         let aX = clampFinger(anchorX.flatMap { $0.isFinite ? $0 : nil } ?? 0.5)
         let aY = clampFinger(anchorY.flatMap { $0.isFinite ? $0 : nil } ?? 0.5)
 
-        inputQueue.async { [self] in
-            if !scrollDragActive {
-                // Anchor a fresh gesture under the cursor so iOS hit-tests the
-                // right scroll view (e.g. a bottom sheet vs. the map behind it).
-                scrollAnchorX = aX
-                scrollAnchorY = aY
-                scrollFingerX = aX
-                scrollFingerY = aY
-                beginDrag(x: scrollFingerX, y: scrollFingerY)
-                scrollDragActive = true
-            }
-
-            var nextX = scrollFingerX + stepX
-            var nextY = scrollFingerY + stepY
-
-            // Near an edge: lift, re-anchor back under the cursor, and continue.
-            // Re-beginning at the anchor keeps the gesture hit-testing the same view.
-            if nextX <= HIDInjector.scrollEdgeMargin || nextX >= 1 - HIDInjector.scrollEdgeMargin ||
-               nextY <= HIDInjector.scrollEdgeMargin || nextY >= 1 - HIDInjector.scrollEdgeMargin {
-                rawSendTouch(type: "end", x: scrollFingerX, y: scrollFingerY)
-                scrollFingerX = scrollAnchorX
-                scrollFingerY = scrollAnchorY
-                beginDrag(x: scrollFingerX, y: scrollFingerY)
-                nextX = scrollFingerX + stepX
-                nextY = scrollFingerY + stepY
-            }
-
-            scrollFingerX = clampFinger(nextX)
-            scrollFingerY = clampFinger(nextY)
-            rawSendTouch(type: "move", x: scrollFingerX, y: scrollFingerY)
-
-            // End the drag shortly after the wheel goes idle.
-            scrollEndWork?.cancel()
-            let work = DispatchWorkItem { [self] in
-                guard scrollDragActive else { return }
-                rawSendTouch(type: "end", x: scrollFingerX, y: scrollFingerY)
-                scrollDragActive = false
-            }
-            scrollEndWork = work
-            inputQueue.asyncAfter(deadline: .now() + HIDInjector.scrollGestureIdle, execute: work)
+        if !scrollDragActive {
+            // Anchor a fresh gesture under the cursor so iOS hit-tests the
+            // right scroll view (e.g. a bottom sheet vs. the map behind it).
+            scrollAnchorX = aX
+            scrollAnchorY = aY
+            scrollFingerX = aX
+            scrollFingerY = aY
+            beginDrag(x: scrollFingerX, y: scrollFingerY)
+            scrollDragActive = true
         }
+
+        var nextX = scrollFingerX + stepX
+        var nextY = scrollFingerY + stepY
+
+        // Near an edge: lift, re-anchor back under the cursor, and continue.
+        // Re-beginning at the anchor keeps the gesture hit-testing the same view.
+        if nextX <= HIDInjector.scrollEdgeMargin || nextX >= 1 - HIDInjector.scrollEdgeMargin ||
+            nextY <= HIDInjector.scrollEdgeMargin || nextY >= 1 - HIDInjector.scrollEdgeMargin {
+            rawSendTouch(type: "end", x: scrollFingerX, y: scrollFingerY)
+            scrollFingerX = scrollAnchorX
+            scrollFingerY = scrollAnchorY
+            beginDrag(x: scrollFingerX, y: scrollFingerY)
+            nextX = scrollFingerX + stepX
+            nextY = scrollFingerY + stepY
+        }
+
+        scrollFingerX = clampFinger(nextX)
+        scrollFingerY = clampFinger(nextY)
+        rawSendTouch(type: "move", x: scrollFingerX, y: scrollFingerY)
+
+        // End the drag shortly after the wheel goes idle.
+        scrollEndWork?.cancel()
+        let work = DispatchWorkItem { [self] in
+            guard scrollDragActive else { return }
+            rawSendTouch(type: "end", x: scrollFingerX, y: scrollFingerY)
+            scrollDragActive = false
+        }
+        scrollEndWork = work
+
+        try? await Task.sleep(for: .seconds(HIDInjector.scrollGestureIdle))
+        work.perform()
     }
 
     /// Press an arbitrary hardware button identified by its HID (page, usage),
@@ -396,7 +392,7 @@ final class HIDInjector {
     /// volume up/down, the action button, and the watch side button.
     /// - phase: "down" / "up" hold the button for natural long-presses (power
     ///   off slider, side-button menus); "press" sends a momentary down+up.
-    func sendButtonHID(page: UInt32, usage: UInt32, phase: String) {
+    func sendButtonHID(page: UInt32, usage: UInt32, phase: String) async {
         guard let arb = hidArbitraryFunc else {
             print("[hid] Arbitrary HID injection unavailable (page=\(page) usage=\(usage))")
             return
@@ -410,19 +406,17 @@ final class HIDInjector {
             rawSend(msg)
         }
         hidLog("[hid] HID button page=\(page) usage=\(usage) phase=\(phase)")
-        inputQueue.async {
-            switch phase {
-            case "down": emit(1)
-            case "up":   emit(2)
-            default:
-                emit(1)
-                Thread.sleep(forTimeInterval: 0.05)
-                emit(2)
-            }
+        switch phase {
+        case "down": emit(1)
+        case "up":   emit(2)
+        default:
+            emit(1)
+            try? await Task.sleep(for: .seconds(0.05))
+            emit(2)
         }
     }
 
-    func sendButton(button: String, deviceUDID: String) {
+    func sendButton(button: String, deviceUDID: String) async {
         hidLog("[hid] Sending button: \(button)")
 
         switch button {
@@ -437,44 +431,34 @@ final class HIDInjector {
             launchSpringBoard(deviceUDID: deviceUDID)
 
         case "swipe_home":
-            inputQueue.async { [self] in
-                sendSwipeHome()
-            }
+            sendSwipeHome()
 
         case "app_switcher":
             if buttonFunc != nil {
                 // Double home press with delay for app switcher
-                inputQueue.async { [self] in
-                    sendHIDButton(eventSource: Self.buttonSourceHome, direction: Self.buttonDown)
-                    sendHIDButton(eventSource: Self.buttonSourceHome, direction: Self.buttonUp)
-                    Thread.sleep(forTimeInterval: 0.15)
-                    sendHIDButton(eventSource: Self.buttonSourceHome, direction: Self.buttonDown)
-                    sendHIDButton(eventSource: Self.buttonSourceHome, direction: Self.buttonUp)
-                }
+                sendHIDButton(eventSource: Self.buttonSourceHome, direction: Self.buttonDown)
+                sendHIDButton(eventSource: Self.buttonSourceHome, direction: Self.buttonUp)
+                try? await Task.sleep(for: .seconds(0.15))
+                sendHIDButton(eventSource: Self.buttonSourceHome, direction: Self.buttonDown)
+                sendHIDButton(eventSource: Self.buttonSourceHome, direction: Self.buttonUp)
             } else {
                 print("[hid] App switcher not available (IndigoHIDMessageForButton not loaded)")
             }
 
         case "lock":
-            inputQueue.async { [self] in
-                sendHIDButton(eventSource: Self.buttonSourceLock, direction: Self.buttonDown)
-                sendHIDButton(eventSource: Self.buttonSourceLock, direction: Self.buttonUp)
-            }
+            sendHIDButton(eventSource: Self.buttonSourceLock, direction: Self.buttonDown)
+            sendHIDButton(eventSource: Self.buttonSourceLock, direction: Self.buttonUp)
 
         case "siri":
             // Holding Siri for ~300ms matches Simulator.app's "hold side button
             // to invoke Siri" gesture; a tap is ignored.
-            inputQueue.async { [self] in
-                sendHIDButton(eventSource: Self.buttonSourceSiri, direction: Self.buttonDown)
-                Thread.sleep(forTimeInterval: 0.3)
-                sendHIDButton(eventSource: Self.buttonSourceSiri, direction: Self.buttonUp)
-            }
+            sendHIDButton(eventSource: Self.buttonSourceSiri, direction: Self.buttonDown)
+            try? await Task.sleep(for: .seconds(0.3))
+            sendHIDButton(eventSource: Self.buttonSourceSiri, direction: Self.buttonUp)
 
         case "side_button":
-            inputQueue.async { [self] in
-                sendHIDButton(eventSource: Self.buttonSourceSideButton, direction: Self.buttonDown)
-                sendHIDButton(eventSource: Self.buttonSourceSideButton, direction: Self.buttonUp)
-            }
+            sendHIDButton(eventSource: Self.buttonSourceSideButton, direction: Self.buttonDown)
+            sendHIDButton(eventSource: Self.buttonSourceSideButton, direction: Self.buttonUp)
 
         default:
             print("[hid] Unknown button: \(button)")
@@ -515,10 +499,8 @@ final class HIDInjector {
             print("[hid] Software keyboard toggle unavailable (IndigoHIDMessageForButton not loaded)")
             return
         }
-        inputQueue.async { [self] in
-            sendHIDButton(eventSource: Self.buttonSourceSoftwareKeyboard, direction: Self.buttonDown)
-            sendHIDButton(eventSource: Self.buttonSourceSoftwareKeyboard, direction: Self.buttonUp)
-        }
+        sendHIDButton(eventSource: Self.buttonSourceSoftwareKeyboard, direction: Self.buttonDown)
+        sendHIDButton(eventSource: Self.buttonSourceSoftwareKeyboard, direction: Self.buttonUp)
     }
 
     /// Ask CoreSimulator to broadcast a memory warning to the simulated OS.

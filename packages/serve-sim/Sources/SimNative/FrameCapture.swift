@@ -12,14 +12,17 @@ import ObjectiveC
 /// for late-joining clients.
 ///
 /// Pipeline: IOSurface (shared memory) → CVPixelBuffer (zero-copy) → H.264 encode
-final class FrameCapture {
+actor FrameCapture {
+    private let queue = DispatchSerialQueue(label: "frame-capture", qos: .userInteractive)
+    nonisolated var unownedExecutor: UnownedSerialExecutor { queue.asUnownedSerialExecutor() }
+
+    private var photocopier = Photocopier()
     private var onFrame: ((CVPixelBuffer, CMTime) -> Void)?
     private var frameCount: UInt64 = 0
     private(set) var capturedWidth: Int = 0
     private(set) var capturedHeight: Int = 0
-    private var idleTimer: DispatchSourceTimer?
-    private let captureQueue = DispatchQueue(label: "frame-capture", qos: .userInteractive)
-    private var lastCaptureTimeMs: UInt64 = 0
+    private var idleTimer: Task<Void, Never>?
+    private var lastCaptureTime: ContinuousClock.Instant = .now
     private var lastSeeds: [ObjectIdentifier: UInt32] = [:]
     private var rewireTickCount: Int = 0
     /// Interval at which the idle timer re-emits the current frame even when
@@ -32,13 +35,13 @@ final class FrameCapture {
     ///    one subscriber is due for it — a late-joining relay subscriber on an
     ///    idle sim never gets a cached frame to show.
     /// Re-emitting at ~5 fps fixes both without meaningful CPU cost.
-    private static let idleIntervalMs: UInt64 = 200
+    private static let idleInterval: ContinuousClock.Duration = .milliseconds(200)
 
     private var descriptors: [NSObject] = []
-    private var callbackUUIDs: [ObjectIdentifier: NSUUID] = [:]
+    private var callbackUUIDs: [ObjectIdentifier: UUID] = [:]
     private var ioClient: NSObject?
 
-    func start(deviceUDID: String, onFrame: @escaping (CVPixelBuffer, CMTime) -> Void) throws {
+    func start(deviceUDID: String, onFrame: @escaping @Sendable (CVPixelBuffer, CMTime) -> Void) throws {
         self.onFrame = onFrame
 
         SimFrameworks.load()
@@ -156,70 +159,56 @@ final class FrameCapture {
 
     // MARK: - Frame callbacks via objc_msgSend
 
-    private func registerFrameCallbacks(desc: NSObject) throws {
-        let regSel = NSSelectorFromString("registerScreenCallbacksWithUUID:callbackQueue:frameCallback:surfacesChangedCallback:propertiesChangedCallback:")
+    private func registerFrameCallbacks(desc: AnyObject) throws {
+        let regSel = #selector(FramebufferDescriptor.registerScreenCallbacks)
         guard desc.responds(to: regSel) else {
             throw makeError(8, "Descriptor doesn't support registerScreenCallbacks")
         }
 
-        guard let msgSendPtr = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "objc_msgSend") else {
-            throw makeError(9, "objc_msgSend not found")
-        }
-
-        typealias MsgSendFunc = @convention(c) (
-            AnyObject, Selector, AnyObject, AnyObject, AnyObject, AnyObject, AnyObject
-        ) -> Void
-        let msgSend = unsafeBitCast(msgSendPtr, to: MsgSendFunc.self)
-
-        let uuid = NSUUID()
+        let uuid = UUID()
         callbackUUIDs[ObjectIdentifier(desc)] = uuid
 
-        let frameCallback: @convention(block) () -> Void = { [weak self] in
-            self?.captureQueue.async { self?.captureFrame() }
-        }
-        let surfacesCallback: @convention(block) () -> Void = { [weak self] in
-            self?.captureQueue.async { self?.captureFrame() }
-        }
-        let propsCallback: @convention(block) () -> Void = {}
-
-        msgSend(
-            desc, regSel,
-            uuid, captureQueue as AnyObject,
-            frameCallback as AnyObject, surfacesCallback as AnyObject, propsCallback as AnyObject
+        desc.registerScreenCallbacks(
+            uuid: uuid,
+            callbackQueue: queue,
+            frameCallback: { [self] in assumeIsolated { $0.captureFrame() } },
+            surfacesChangedCallback: { [self] in assumeIsolated { $0.captureFrame() } },
+            propertiesChangedCallback: {}
         )
     }
 
     private func startIdleTimer() {
-        let timer = DispatchSource.makeTimerSource(queue: captureQueue)
-        timer.schedule(deadline: .now().advanced(by: .milliseconds(Int(Self.idleIntervalMs))),
-                       repeating: .milliseconds(Int(Self.idleIntervalMs)))
-        timer.setEventHandler { [weak self] in
-            guard let self else { return }
-            let nowMs = DispatchTime.now().uptimeNanoseconds / 1_000_000
-            if (nowMs - self.lastCaptureTimeMs) >= Self.idleIntervalMs {
-                self.captureFrame()
+        self.idleTimer = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                await self.onIdleTimerTick()
+                try? await Task.sleep(for: Self.idleInterval)
             }
-            // Self-heal: if we've never captured a frame, the cached descriptor
-            // is likely stale. Re-wire the pipeline periodically (every ~1s)
-            // until frames start flowing.
-            if self.frameCount == 0 {
-                self.rewireTickCount += 1
-                if self.rewireTickCount % 5 == 0 {
-                    do {
-                        try self.wireUpFramebuffer()
-                    } catch {
-                        // Swallow — we'll try again on the next tick.
-                    }
+        }
+    }
+
+    private func onIdleTimerTick() {
+        let now = ContinuousClock.now
+        guard (now - self.lastCaptureTime) >= Self.idleInterval else { return }
+        self.captureFrame(force: true)
+        // Self-heal: if we've never captured a frame, the cached descriptor
+        // is likely stale. Re-wire the pipeline periodically (every ~1s)
+        // until frames start flowing.
+        if self.frameCount == 0 {
+            self.rewireTickCount += 1
+            if self.rewireTickCount % 5 == 0 {
+                do {
+                    try self.wireUpFramebuffer()
+                } catch {
+                    // Swallow — we'll try again on the next tick.
                 }
             }
         }
-        timer.resume()
-        self.idleTimer = timer
     }
 
     // MARK: - Frame capture
 
-    private func captureFrame() {
+    private func captureFrame(force: Bool = false) {
         guard let desc = pickBestDescriptor() else { return }
 
         let surfSel = NSSelectorFromString("framebufferSurface")
@@ -230,14 +219,11 @@ final class FrameCapture {
         // don't spend cycles re-encoding the same pixels back-to-back from the
         // frame-callback path. BUT: we must still re-emit at the idle floor
         // (~5 fps) so that downstream consumers keep seeing a live stream —
-        // see the `idleIntervalMs` doc-comment for why that matters.
+        // see the `idleInterval` doc-comment for why that matters.
         let key = ObjectIdentifier(desc)
         let seed = IOSurfaceGetSeed(surface)
-        let nowMs = DispatchTime.now().uptimeNanoseconds / 1_000_000
-        let sinceLastMs = nowMs &- lastCaptureTimeMs
         let seedChanged = lastSeeds[key] != seed
-        let idleRefreshDue = frameCount > 0 && sinceLastMs >= Self.idleIntervalMs
-        if frameCount > 0, !seedChanged, !idleRefreshDue { return }
+        if frameCount > 0, !seedChanged, !force { return }
         lastSeeds[key] = seed
 
         let w = IOSurfaceGetWidth(surface)
@@ -258,10 +244,11 @@ final class FrameCapture {
         )
         guard status == kCVReturnSuccess, let pb = pixelBuffer?.takeRetainedValue() else { return }
 
-        lastCaptureTimeMs = nowMs
+        lastCaptureTime = .now
         frameCount += 1
         let timestamp = CMTime(value: CMTimeValue(frameCount), timescale: 60)
-        onFrame?(pb, timestamp)
+        guard let copy = photocopier.copy(pb) else { return }
+        onFrame?(copy, timestamp)
     }
 
     func getScreenSize() -> (width: Int, height: Int)? {
@@ -307,4 +294,15 @@ final class FrameCapture {
             ($0.value(forKey: "UDID") as? NSUUID)?.uuidString == udid
         })
     }
+}
+
+@objc protocol FramebufferDescriptor {
+    @objc(registerScreenCallbacksWithUUID:callbackQueue:frameCallback:surfacesChangedCallback:propertiesChangedCallback:)
+    func registerScreenCallbacks(
+        uuid: UUID,
+        callbackQueue: DispatchQueue,
+        frameCallback: @convention(block) @escaping () -> Void,
+        surfacesChangedCallback: @convention(block) @escaping () -> Void,
+        propertiesChangedCallback: @convention(block) @escaping () -> Void
+    )
 }
