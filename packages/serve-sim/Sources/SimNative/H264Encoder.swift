@@ -11,7 +11,10 @@ import VideoToolbox
 /// The incoming buffer wraps SimulatorKit's live framebuffer IOSurface, which
 /// SimulatorKit recycles in place — VT encodes asynchronously, so we deep-copy
 /// into a private pooled buffer before submitting to avoid a torn frame race.
-final class H264Encoder {
+actor H264Encoder {
+    let queue = DispatchSerialQueue(label: "h264-encoder", qos: .userInteractive)
+    nonisolated var unownedExecutor: UnownedSerialExecutor { queue.asUnownedSerialExecutor() }
+
     struct Encoded {
         /// avcC parameter-set blob — emitted once on the first IDR per session.
         let description: Data?
@@ -21,16 +24,12 @@ final class H264Encoder {
         enum Kind { case keyframe, delta }
     }
 
-    var onEncoded: ((Encoded) -> Void)?
-
-    private let lock = NSLock()
     private var session: VTCompressionSession?
     private var pool: CVPixelBufferPool?
     private var width: Int32 = 0
     private var height: Int32 = 0
     private let fps: Int32
     private var bitrate: Int
-    private let stateQueue = DispatchQueue(label: "H264Encoder.state")
     private var emittedDescription = false
     private var frameCount: Int64 = 0
 
@@ -44,8 +43,7 @@ final class H264Encoder {
     }
 
     /// Submit a frame. Returns immediately; `onEncoded` fires on VT's queue.
-    func encode(_ source: CVPixelBuffer, forceKeyframe: Bool = false, completion: (() -> Void)? = nil) {
-        lock.lock()
+    func encode(_ source: CVPixelBuffer, forceKeyframe: Bool = false) async -> Encoded? {
         let w = Int32(CVPixelBufferGetWidth(source))
         let h = Int32(CVPixelBufferGetHeight(source))
         if session == nil || w != width || h != height {
@@ -54,9 +52,7 @@ final class H264Encoder {
             rebuildSession()
         }
         guard let session, let copy = copyBuffer(source) else {
-            lock.unlock()
-            completion?()
-            return
+            return nil
         }
 
         frameCount += 1
@@ -64,28 +60,31 @@ final class H264Encoder {
         let frameProps: NSDictionary? = forceKeyframe
             ? [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue!] as NSDictionary
             : nil
-        lock.unlock()
 
-        let status = VTCompressionSessionEncodeFrame(
-            session,
-            imageBuffer: copy,
-            presentationTimeStamp: pts,
-            duration: .invalid,
-            frameProperties: frameProps,
-            infoFlagsOut: nil
-        ) { [weak self] status, _, sampleBuffer in
-            defer { completion?() }
-            guard let self, status == noErr, let sb = sampleBuffer else { return }
-            if let encoded = self.extract(from: sb) { self.onEncoded?(encoded) }
+        let buffer: CMSampleBuffer? = await withCheckedContinuation { continuation in
+            let status = VTCompressionSessionEncodeFrame(
+                session,
+                imageBuffer: copy,
+                presentationTimeStamp: pts,
+                duration: .invalid,
+                frameProperties: frameProps,
+                infoFlagsOut: nil
+            ) { @Sendable status, _, sampleBuffer in
+                guard status == noErr, let sb = sampleBuffer else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                continuation.resume(returning: sb)
+            }
+            if status != noErr {
+                continuation.resume(returning: nil)
+            }
         }
-        if status != noErr {
-            completion?()
-        }
+        guard let buffer else { return nil }
+        return extract(from: buffer)
     }
 
     func stop() {
-        lock.lock()
-        defer { lock.unlock() }
         if let session {
             VTCompressionSessionInvalidate(session)
             self.session = nil
@@ -173,9 +172,7 @@ final class H264Encoder {
         }
         VTCompressionSessionPrepareToEncodeFrames(sess)
         session = sess
-        stateQueue.sync {
-            emittedDescription = false
-        }
+        emittedDescription = false
 
         // Pool feeding the deep-copy; BGRA matches the framebuffer surface.
         let attrs: [String: Any] = [
@@ -204,12 +201,8 @@ final class H264Encoder {
         var description: Data?
         if isKeyframe, let format = CMSampleBufferGetFormatDescription(sample) {
             let nextDescription = avcCBlob(from: format)
-            let shouldEmit = stateQueue.sync { () -> Bool in
-                if emittedDescription { return false }
-                emittedDescription = nextDescription != nil
-                return nextDescription != nil
-            }
-            if shouldEmit {
+            if !emittedDescription && nextDescription != nil {
+                emittedDescription = true
                 description = nextDescription
             }
         }

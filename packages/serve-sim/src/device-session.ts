@@ -16,6 +16,7 @@
  */
 import type { IncomingMessage, ServerResponse } from "http";
 import { NativeCapture, NativeHid, Orientation, axDescribeAsync, axFrontmostAsync, type NativeFrame } from "./native";
+import { debugHelper } from "./debug";
 
 /**
  * Minimal WebSocket surface the HID input channel needs. Satisfied by both the
@@ -53,11 +54,11 @@ function mjpegHeader(jpegLength: number): Buffer {
   return Buffer.from(`--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${jpegLength}\r\n\r\n`, "ascii");
 }
 
-function avccSeed(jpeg: Buffer): Buffer {
+function avccSeed(jpeg: Uint8Array): Buffer {
   const out = Buffer.allocUnsafe(5 + jpeg.length);
   out.writeUInt32BE(jpeg.length + 1, 0); // length covers the tag byte + payload
   out[4] = AVCC_SEED_TAG;
-  jpeg.copy(out, 5);
+  // out.set(jpeg, 5);
   return out;
 }
 
@@ -68,6 +69,11 @@ const ORIENTATION_BY_NAME: Record<string, number> = {
   landscape_right: Orientation.landscapeRight,
 };
 
+class Client {
+  isFull = false;
+  constructor(public readonly res: ServerResponse) {}
+}
+
 export class DeviceSession {
   private readonly capture: NativeCapture;
   private readonly hid: NativeHid;
@@ -77,9 +83,9 @@ export class DeviceSession {
   private height = 0;
   private orientation = "portrait";
 
-  private latestJpeg: Buffer | null = null;
-  private cachedAvccDescription: Buffer | null = null;
-  private readonly mjpegClients = new Set<ServerResponse>();
+  private latestJpeg: Uint8Array | null = null;
+  private cachedAvccDescription: Uint8Array | null = null;
+  private readonly mjpegClients = new Set<Client>();
   private readonly avccClients = new Set<ServerResponse>();
   private readonly hidSockets = new Set<HidSocket>();
 
@@ -96,7 +102,7 @@ export class DeviceSession {
   }
 
   close(): void {
-    for (const res of this.mjpegClients) res.end();
+    for (const res of this.mjpegClients) res.res.end();
     for (const res of this.avccClients) res.end();
     for (const ws of this.hidSockets) ws.close();
     this.mjpegClients.clear();
@@ -109,7 +115,7 @@ export class DeviceSession {
 
   private onFrame(f: NativeFrame): void {
     if (f.codec === "mjpeg") {
-      this.latestJpeg = f.data;
+      // this.latestJpeg = f.data;
       if (f.width !== this.width || f.height !== this.height) {
         this.width = f.width;
         this.height = f.height;
@@ -127,13 +133,18 @@ export class DeviceSession {
   }
 
   /** Write a multipart JPEG part (header + shared frame + boundary) without copying the JPEG. */
-  private writeMjpegFrame(res: ServerResponse, header: Buffer, jpeg: Buffer): void {
-    if (res.writableEnded || res.writableLength > MAX_CLIENT_BACKLOG) return;
-    res.cork();
+  private writeMjpegFrame(client: Client, header: Buffer, jpeg: Uint8Array): void {
+    const { res } = client;
+    if (res.writableEnded) return;
+    const dataLength = header.length + jpeg.length + MJPEG_TRAILER.length;
+    const remainingLength = res.writableHighWaterMark - res.writableLength;
+    if (remainingLength < dataLength) {
+      debugHelper("dropping frames", { dataLength, writableLength: res.writableLength, highWaterMark: res.writableHighWaterMark });
+      return;
+    }
     res.write(header);
     res.write(jpeg);
     res.write(MJPEG_TRAILER);
-    res.uncork();
   }
 
   /**
@@ -143,7 +154,7 @@ export class DeviceSession {
    * re-seeded with the cached description + a fresh keyframe, yielding a clean
    * stream instead of a corrupted one.
    */
-  private writeAvccFrame(res: ServerResponse, chunk: Buffer): void {
+  private writeAvccFrame(res: ServerResponse, chunk: Uint8Array): void {
     if (res.writableEnded) {
       this.avccClients.delete(res);
       return;
@@ -166,9 +177,10 @@ export class DeviceSession {
       Connection: "keep-alive",
       ...CORS,
     });
-    this.mjpegClients.add(res);
-    if (this.latestJpeg) this.writeMjpegFrame(res, mjpegHeader(this.latestJpeg.length), this.latestJpeg); // paint immediately
-    const drop = () => this.mjpegClients.delete(res);
+    const client = new Client(res);
+    this.mjpegClients.add(client);
+    if (this.latestJpeg) this.writeMjpegFrame(client, mjpegHeader(this.latestJpeg.length), this.latestJpeg); // paint immediately
+    const drop = () => this.mjpegClients.delete(client);
     res.on("close", drop);
     res.on("error", drop);
   }

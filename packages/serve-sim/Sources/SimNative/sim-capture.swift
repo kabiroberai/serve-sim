@@ -14,7 +14,7 @@ import CoreMedia
 /// bit1 = keyframe. `data` is a freshly-copied value safe to retain.
 typealias SimFrameCallback = (Int32, Data, Int32, Int32, Int32) -> Void
 
-final class CaptureEngine {
+actor CaptureEngine {
     static let codecMJPEG: Int32 = 0
     static let codecAVCC: Int32 = 1
     static let flagDescription: Int32 = 1 << 0
@@ -26,17 +26,12 @@ final class CaptureEngine {
     private let frameCapture = FrameCapture()
     private let videoEncoder = VideoEncoder(quality: 0.7)
     private let h264Encoder = H264Encoder(fps: 60)
-    private let encodeQueue = DispatchQueue(label: "napi.encode", qos: .userInteractive)
-    private let h264Queue = DispatchQueue(label: "napi.encode.h264", qos: .userInteractive)
     private static let h264EncodeTimeoutMs = 500
 
     // Mirrors main.swift's globals; mutated from the capture queue, read from the
     // encode queues. Benign races (same pattern as the standalone helper).
     private var screenWidth = 0
     private var screenHeight = 0
-    private var encoderReady = false
-    private var encoding = false       // MJPEG backpressure
-    private var h264Encoding = false   // H.264 backpressure
     private var forceKeyframe = false
     private var avccActive = false
     private var h264FrameToken: UInt64 = 0
@@ -46,22 +41,6 @@ final class CaptureEngine {
     init(deviceUDID: String, onFrame: @escaping SimFrameCallback) {
         self.deviceUDID = deviceUDID
         self.onFrame = onFrame
-
-        h264Encoder.onEncoded = { [weak self] encoded in
-            guard let self else { return }
-            if let description = encoded.description {
-                self.emit(codec: Self.codecAVCC,
-                          data: AVCCEnvelope.description(avcc: description),
-                          flags: Self.flagDescription)
-            }
-            switch encoded.kind {
-            case .keyframe:
-                self.emit(codec: Self.codecAVCC, data: AVCCEnvelope.keyframe(avcc: encoded.avcc),
-                          flags: Self.flagKeyframe)
-            case .delta:
-                self.emit(codec: Self.codecAVCC, data: AVCCEnvelope.delta(avcc: encoded.avcc), flags: 0)
-            }
-        }
     }
 
     /// Hand encoded bytes to the binding. Gated by `stopped` so no callback fires
@@ -75,56 +54,67 @@ final class CaptureEngine {
         guard !started else { return }
         // Latch `started` only after capture actually begins: if start() throws
         // (e.g. device not booted), a later retry should still be allowed.
+        let (frames, frameContinuation) = AsyncStream.makeStream(
+            of: CVPixelBuffer.self,
+            // drop old frames if there's backpressure
+            bufferingPolicy: .bufferingNewest(1)
+        )
         try frameCapture.start(deviceUDID: deviceUDID) { [weak self] pixelBuffer, _ in
-            self?.handleFrame(pixelBuffer)
+            guard let self else { return }
+            // TODO: skip if there's backpressure
+            if let copy = self.copyPixelBuffer(pixelBuffer) {
+                frameContinuation.yield(copy)
+            }
+        }
+        Task {
+            for await frame in frames {
+                await handleFrame(frame)
+            }
         }
         started = true
     }
 
-    private func handleFrame(_ pixelBuffer: CVPixelBuffer) {
-        let w = CVPixelBufferGetWidth(pixelBuffer)
-        let h = CVPixelBufferGetHeight(pixelBuffer)
+    private func handleFrame(_ pixelBuffer: CVPixelBuffer) async {
+        screenWidth = CVPixelBufferGetWidth(pixelBuffer)
+        screenHeight = CVPixelBufferGetHeight(pixelBuffer)
+        async let handleJPEG = self.handleJPEG(pixelBuffer)
+        async let handleH264 = self.handleH264(pixelBuffer)
+        _ = await (handleJPEG, handleH264)
+    }
 
-        if !encoderReady || w != screenWidth || h != screenHeight {
-            screenWidth = w
-            screenHeight = h
-            videoEncoder.stop()
-            videoEncoder.setup(width: Int32(w), height: Int32(h), fps: 60) { [weak self] jpeg in
-                self?.emit(codec: Self.codecMJPEG, data: jpeg, flags: 0)
-            }
-            encoderReady = true
-        }
+    private func handleJPEG(_ pixelBuffer: CVPixelBuffer) async {
+        guard let jpeg = await self.videoEncoder.encode(pixelBuffer: pixelBuffer) else { return }
+        emit(codec: Self.codecMJPEG, data: jpeg, flags: 0)
+    }
 
-        let h264Request = reserveH264EncodeIfNeeded()
-        let shouldEncodeJpeg = encoderReady && !encoding
-        if !shouldEncodeJpeg && h264Request == nil { return }
-
-        guard let stableFrame = copyPixelBuffer(pixelBuffer) else {
-            if let h264Request {
-                finishH264Encode(token: h264Request.token, restoreKeyframe: h264Request.forceKeyframe)
-            }
-            return
-        }
-
-        if shouldEncodeJpeg {
-            encoding = true
-            encodeQueue.async { [weak self] in
-                guard let self else { return }
-                self.videoEncoder.encode(pixelBuffer: stableFrame)
-                self.encoding = false
-            }
-        }
-
+    private func handleH264(_ pixelBuffer: CVPixelBuffer) async {
         // H.264 runs only while a viewer wants AVCC, so an all-MJPEG session pays
         // no VideoToolbox cost.
-        if let h264Request {
-            h264Queue.async { [weak self] in
-                guard let self else { return }
-                self.h264Encoder.encode(stableFrame, forceKeyframe: h264Request.forceKeyframe) {
-                    self.finishH264Encode(token: h264Request.token)
-                }
-                self.scheduleH264EncodeTimeout(token: h264Request.token)
-            }
+        guard let h264Request = reserveH264EncodeIfNeeded() else { return }
+        // TODO: cancel after h264EncodeTimeoutMs
+        guard let encoded = await h264Encoder.encode(pixelBuffer, forceKeyframe: h264Request.forceKeyframe)
+              else { return }
+
+        if let description = encoded.description {
+            emit(
+                codec: Self.codecAVCC,
+                data: AVCCEnvelope.description(avcc: description),
+                flags: Self.flagDescription
+            )
+        }
+        switch encoded.kind {
+        case .keyframe:
+            emit(
+                codec: Self.codecAVCC,
+                data: AVCCEnvelope.keyframe(avcc: encoded.avcc),
+                flags: Self.flagKeyframe
+            )
+        case .delta:
+            emit(
+                codec: Self.codecAVCC,
+                data: AVCCEnvelope.delta(avcc: encoded.avcc),
+                flags: 0
+            )
         }
     }
 
@@ -132,7 +122,7 @@ final class CaptureEngine {
     /// encoders run later and SimulatorKit recycles/mutates that IOSurface in
     /// place, so passing the wrapper CVPixelBuffer across queues can encode a
     /// half-updated frame.
-    private func copyPixelBuffer(_ source: CVPixelBuffer) -> CVPixelBuffer? {
+    private nonisolated func copyPixelBuffer(_ source: CVPixelBuffer) -> CVPixelBuffer? {
         let width = CVPixelBufferGetWidth(source)
         let height = CVPixelBufferGetHeight(source)
         let pixelFormat = CVPixelBufferGetPixelFormatType(source)
@@ -167,44 +157,23 @@ final class CaptureEngine {
     }
 
     private func reserveH264EncodeIfNeeded() -> (forceKeyframe: Bool, token: UInt64)? {
-        h264Queue.sync {
-            guard avccActive, !h264Encoding else { return nil }
-            h264Encoding = true
-            h264FrameToken &+= 1
-            let token = h264FrameToken
-            let force = forceKeyframe
-            forceKeyframe = false
-            return (forceKeyframe: force, token: token)
-        }
-    }
-
-    private func finishH264Encode(token: UInt64, restoreKeyframe: Bool = false) {
-        h264Queue.async { [weak self] in
-            guard let self, self.h264FrameToken == token else { return }
-            self.h264Encoding = false
-            if restoreKeyframe { self.forceKeyframe = true }
-        }
-    }
-
-    private func scheduleH264EncodeTimeout(token: UInt64) {
-        h264Queue.asyncAfter(deadline: .now().advanced(by: .milliseconds(Self.h264EncodeTimeoutMs))) { [weak self] in
-            guard let self, self.h264FrameToken == token else { return }
-            self.h264Encoding = false
-        }
+        guard avccActive else { return nil }
+        h264FrameToken &+= 1
+        let token = h264FrameToken
+        let force = forceKeyframe
+        forceKeyframe = false
+        return (forceKeyframe: force, token: token)
     }
 
     /// Toggle H.264 encoding. Turning it on forces the next frame to an IDR so a
     /// freshly-connected decoder has a keyframe to start from.
     func setAvccActive(_ active: Bool) {
-        h264Queue.async { [weak self] in
-            guard let self else { return }
-            if active && !self.avccActive { self.forceKeyframe = true }
-            self.avccActive = active
-        }
+        if active && !self.avccActive { self.forceKeyframe = true }
+        self.avccActive = active
     }
 
     func requestKeyframe() {
-        h264Queue.async { [weak self] in self?.forceKeyframe = true }
+        self.forceKeyframe = true
     }
 
     func screenSize() -> (Int, Int) { (screenWidth, screenHeight) }
@@ -216,9 +185,6 @@ final class CaptureEngine {
         if stopped { return }
         stopped = true
         frameCapture.stop()
-        encodeQueue.sync {}
-        h264Queue.sync {}
-        videoEncoder.stop()
-        h264Encoder.stop()
+        Task { [h264Encoder] in await h264Encoder.stop() }
     }
 }

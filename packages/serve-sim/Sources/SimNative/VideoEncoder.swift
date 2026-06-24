@@ -5,7 +5,11 @@ import ImageIO
 import UniformTypeIdentifiers
 
 /// Encodes CVPixelBuffer frames as JPEG data for MJPEG streaming.
-final class VideoEncoder {
+actor VideoEncoder {
+    let queue = DispatchSerialQueue(label: "video-encoder", qos: .userInteractive)
+
+    nonisolated var unownedExecutor: UnownedSerialExecutor { queue.asUnownedSerialExecutor() }
+
     private var onEncodedFrame: ((Data) -> Void)?
     private let quality: CGFloat
 
@@ -13,19 +17,13 @@ final class VideoEncoder {
         self.quality = quality
     }
 
-    func setup(width: Int32, height: Int32, fps: Int,
-               onEncodedFrame: @escaping (Data) -> Void) {
-        self.onEncodedFrame = onEncodedFrame
-        print("[encoder] JPEG encoder ready at \(width)x\(height) (quality: \(quality))")
-    }
-
-    func encode(pixelBuffer: CVPixelBuffer) {
+    func encode(pixelBuffer: CVPixelBuffer) -> Data? {
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
 
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
-        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else { return }
+        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else { return nil }
         let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
 
         let colorSpace = CGColorSpaceCreateDeviceRGB()
@@ -37,17 +35,13 @@ final class VideoEncoder {
             bytesPerRow: bytesPerRow,
             space: colorSpace,
             bitmapInfo: CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue
-        ), let cgImage = context.makeImage() else { return }
+        ), let cgImage = context.makeImage() else { return nil }
 
         let data = NSMutableData()
-        guard let dest = CGImageDestinationCreateWithData(data as CFMutableData, "public.jpeg" as CFString, 1, nil) else { return }
+        guard let dest = CGImageDestinationCreateWithData(data as CFMutableData, "public.jpeg" as CFString, 1, nil) else { return nil }
         CGImageDestinationAddImage(dest, cgImage, [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
-        guard CGImageDestinationFinalize(dest) else { return }
+        guard CGImageDestinationFinalize(dest) else { return nil }
 
-        onEncodedFrame?(data as Data)
-    }
-
-    func stop() {
-        onEncodedFrame = nil
+        return data as Data
     }
 }

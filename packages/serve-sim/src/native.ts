@@ -11,6 +11,7 @@ import { createRequire } from "module";
 import { dirname, join } from "path";
 import { existsSync } from "fs";
 import { fileURLToPath } from "url";
+import { debugHelper } from "./debug";
 
 const require = createRequire(import.meta.url);
 
@@ -48,7 +49,7 @@ interface NativeAddon {
 }
 
 // (codec, data, width, height, flags) — codec 0=MJPEG 1=AVCC; flags bit0=desc bit1=keyframe.
-type RawFrameCallback = (codec: number, data: Buffer, width: number, height: number, flags: number) => void;
+type RawFrameCallback = (codec: number, data: Uint8Array, width: number, height: number, flags: number) => void;
 
 const CODEC_AVCC = 1;
 const FLAG_DESCRIPTION = 1 << 0;
@@ -58,7 +59,7 @@ export interface NativeFrame {
   /** `mjpeg` = a full JPEG; `avcc` = a length-prefixed AVCC envelope chunk. */
   codec: "mjpeg" | "avcc";
   /** Encoded bytes, ready to write to the stream wire. */
-  data: Buffer;
+  data: Uint8Array;
   width: number;
   height: number;
   /** AVCC only: this chunk is the avcC parameter-set blob (decoder config). */
@@ -111,6 +112,7 @@ function load(): NativeAddon {
  */
 export class NativeHid {
   private readonly handle: SimHIDHandle;
+  private lastTimeout?: NodeJS.Timeout;
 
   constructor(udid: string) {
     this.handle = new (load().SimHID)(udid);
@@ -125,6 +127,14 @@ export class NativeHid {
   // `guard` restores that isolation by swallowing malformed-input errors.
   private guard<T>(op: string, fn: () => T, fallback: T): T {
     try {
+      // debugHelper("guard", op)
+      // if (this.lastTimeout) {
+      //   clearTimeout(this.lastTimeout);
+      //   this.lastTimeout = undefined;
+      // }
+      // this.lastTimeout = setTimeout(() => {
+      //   if (global.gc) global.gc({ execution: "sync", flavor: "regular" })
+      // }, 2000)
       return fn();
     } catch (err) {
       console.error(`[hid] ${op} ignored bad input:`, err instanceof Error ? err.message : err);

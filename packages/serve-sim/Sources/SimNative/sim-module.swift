@@ -27,60 +27,60 @@ private func u32(_ v: Int) -> UInt32 {
     @NodeConstructor init(_ udid: String) throws {
         self.udid = udid
         injector = HIDInjector()
-        try injector.setup(deviceUDID: udid)
+        Task { try await injector.setup(deviceUDID: udid) }
     }
 
     @NodeMethod func touch(_ type: String, _ x: Double, _ y: Double,
-                           _ w: Int, _ h: Int, _ edge: Int) {
-        injector.sendTouch(type: type, x: x, y: y,
+                           _ w: Int, _ h: Int, _ edge: Int) async {
+        await injector.sendTouch(type: type, x: x, y: y,
                            screenWidth: w, screenHeight: h, edge: u32(edge))
     }
 
     @NodeMethod func multiTouch(_ type: String, _ x1: Double, _ y1: Double,
-                                _ x2: Double, _ y2: Double, _ w: Int, _ h: Int) {
-        injector.sendMultiTouch(type: type, x1: x1, y1: y1, x2: x2, y2: y2,
+                                _ x2: Double, _ y2: Double, _ w: Int, _ h: Int) async {
+        await injector.sendMultiTouch(type: type, x1: x1, y1: y1, x2: x2, y2: y2,
                                 screenWidth: w, screenHeight: h)
     }
 
-    @NodeMethod func button(_ button: String) {
-        injector.sendButton(button: button, deviceUDID: udid)
+    @NodeMethod func button(_ button: String) async {
+        await injector.sendButton(button: button, deviceUDID: udid)
     }
 
-    @NodeMethod func buttonHid(_ page: Int, _ usage: Int, _ phase: String) {
-        injector.sendButtonHID(page: u32(page), usage: u32(usage), phase: phase)
+    @NodeMethod func buttonHid(_ page: Int, _ usage: Int, _ phase: String) async {
+        await injector.sendButtonHID(page: u32(page), usage: u32(usage), phase: phase)
     }
 
-    @NodeMethod func key(_ type: String, _ usage: Int) {
-        injector.sendKey(type: type, usage: u32(usage))
+    @NodeMethod func key(_ type: String, _ usage: Int) async {
+        await injector.sendKey(type: type, usage: u32(usage))
     }
 
     /// NaN anchorX/anchorY mean "center" (the Swift API's nil).
     @NodeMethod func scroll(_ dx: Double, _ dy: Double,
-                            _ anchorX: Double, _ anchorY: Double, _ w: Int, _ h: Int) {
-        injector.sendScroll(dx: dx, dy: dy,
+                            _ anchorX: Double, _ anchorY: Double, _ w: Int, _ h: Int) async {
+        await injector.sendScroll(dx: dx, dy: dy,
                             anchorX: anchorX.isNaN ? nil : anchorX,
                             anchorY: anchorY.isNaN ? nil : anchorY,
                             screenWidth: w, screenHeight: h)
     }
 
-    @NodeMethod func digitalCrown(_ delta: Double) {
-        injector.sendDigitalCrown(delta: delta)
+    @NodeMethod func digitalCrown(_ delta: Double) async {
+        await injector.sendDigitalCrown(delta: delta)
     }
 
-    @NodeMethod func orientation(_ orientation: Int) -> Bool {
-        injector.sendOrientation(orientation: u32(orientation))
+    @NodeMethod func orientation(_ orientation: Int) async -> Bool {
+        await injector.sendOrientation(orientation: u32(orientation))
     }
 
-    @NodeMethod func memoryWarning() {
-        injector.simulateMemoryWarning()
+    @NodeMethod func memoryWarning() async {
+        await injector.simulateMemoryWarning()
     }
 
-    @NodeMethod func softwareKeyboard() {
-        injector.toggleSoftwareKeyboard()
+    @NodeMethod func softwareKeyboard() async {
+        await injector.toggleSoftwareKeyboard()
     }
 
-    @NodeMethod func caDebug(_ name: String, _ enabled: Bool) -> Bool {
-        injector.setCADebugOption(name: name, enabled: enabled)
+    @NodeMethod func caDebug(_ name: String, _ enabled: Bool) async -> Bool {
+        await injector.setCADebugOption(name: name, enabled: enabled)
     }
 }
 
@@ -104,44 +104,51 @@ private func u32(_ v: Int) -> UInt32 {
         self.onFrame = onFrame
         self.queue = queue
 
+        let rawData = NSMutableData(length: 1024 * 1024 * 10)!
+        let buffer = try NodeArrayBuffer(data: rawData)
+
         // Capture the locals (not self) so the closure can be built before the
         // engine property is initialized, and so it holds no strong ref to self.
         engine = CaptureEngine(deviceUDID: udid) { codec, data, w, h, flags in
+//            let copy = UnsafeMutableBufferPointer<UInt8>.allocate(capacity: data.count)
+//            _ = data.withUnsafeBytes { $0.copyBytes(to: copy) }
             // Runs on a native encode thread. AVCC is inter-frame H.264 — dropping
             // a delta corrupts the decoder until the next IDR — so deliver it
             // blocking; MJPEG is stateless and safe to drop. We copy the bytes
             // into a managed Buffer (NodeBuffer(copying:)) on the JS thread:
             // external buffers crash Bun's GC under frame churn, and the
             // production CLI is a bun-compiled binary.
-            let blocking = codec == CaptureEngine.codecAVCC
-            try? queue.run(blocking: blocking) {
+            try? queue.run {
+                rawData.setData(data)
+//                let buffer = try NodeArrayBuffer(bytes: .init(copy), deallocator: .deallocate)
+                let array = try NodeTypedArray<UInt8>(for: buffer, count: data.count)
                 _ = try? onFrame.call([
-                    Int(codec), try NodeBuffer(copying: data),
+                    Int(codec), array,
                     Int(w), Int(h), Int(flags),
                 ])
             }
         }
     }
 
-    @NodeMethod func start() throws {
-        try engine.start()
+    @NodeMethod func start() async throws {
+        try await engine.start()
     }
 
-    @NodeMethod func setAvccActive(_ active: Bool) {
-        engine.setAvccActive(active)
+    @NodeMethod func setAvccActive(_ active: Bool) async {
+        await engine.setAvccActive(active)
     }
 
-    @NodeMethod func requestKeyframe() {
-        engine.requestKeyframe()
+    @NodeMethod func requestKeyframe() async {
+        await engine.requestKeyframe()
     }
 
-    @NodeMethod func screenSize() -> [String: any NodePropertyConvertible] {
-        let (w, h) = engine.screenSize()
+    @NodeMethod func screenSize() async -> [String: any NodePropertyConvertible] {
+        let (w, h) = await engine.screenSize()
         return ["width": w, "height": h]
     }
 
-    @NodeMethod func stop() {
-        engine.stop()
+    @NodeMethod func stop() async {
+        await engine.stop()
     }
 
     deinit {
@@ -150,7 +157,7 @@ private func u32(_ v: Int) -> UInt32 {
         // encoders so nothing can fire afterwards. The tsfn is released when
         // `queue` deinitializes after this body.
         try? queue.close()
-        engine.stop()
+        Task { [engine] in await engine.stop() }
     }
 }
 

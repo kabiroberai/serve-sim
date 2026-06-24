@@ -4,6 +4,7 @@ import { dirname } from "path";
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "http";
 import type { Socket } from "net";
 import { createConnection, createServer as createNetServer, type Server as NetServer } from "net";
+import { debugHelper } from "./debug";
 
 export function dirnameOf(metaUrl: string): string {
   return dirname(fileURLToPath(metaUrl));
@@ -105,6 +106,7 @@ function createPreviewFrontServer(
   return createNetServer((socket) => {
     let buffered = Buffer.alloc(0);
     const onData = (chunk: Buffer) => {
+      debugHelper("received data", chunk.length);
       buffered = Buffer.concat([buffered, chunk]);
       if (buffered.length > 64 * 1024) {
         socket.destroy();
@@ -146,12 +148,17 @@ export async function servePreview(opts: {
    */
   host?: string;
 }): Promise<PreviewServer> {
-  const internalServer = createHttpServer((req, res) => {
-    opts.middleware(req, res, () => {
-      if (!res.headersSent) res.statusCode = 404;
-      res.end("Not found");
-    });
-  });
+  const internalServer = createHttpServer(
+    {
+      highWaterMark: 1024 * 1024 * 10,
+    },
+    (req, res) => {
+      opts.middleware(req, res, () => {
+        if (!res.headersSent) res.statusCode = 404;
+        res.end("Not found");
+      });
+    }
+  );
   // MJPEG streams + SSE log channel are long-lived; clear the default 2-min
   // socket timeout so they don't get torn down mid-stream.
   internalServer.keepAliveTimeout = 0;
@@ -177,7 +184,7 @@ export async function servePreview(opts: {
     };
     internalServer.once("error", onError);
     internalServer.once("listening", onListening);
-    internalServer.listen(0, "127.0.0.1");
+    internalServer.listen(opts.port, opts.host ?? "127.0.0.1");
   });
 
   const internalAddress = internalServer.address();
@@ -186,28 +193,27 @@ export async function servePreview(opts: {
     throw new Error("Failed to bind preview HTTP server");
   }
 
-  const frontServer = createPreviewFrontServer(opts.middleware, internalAddress.port);
-
-  await new Promise<void>((resolve, reject) => {
-    const onError = (err: Error & { code?: string }) => {
-      frontServer.removeListener("listening", onListening);
-      // The internal server is already listening; if the front fails to bind
-      // (e.g. EADDRINUSE during the port-scan retry loop), close it too so we
-      // don't leak a listener per attempt.
-      internalServer.close(() => reject(err));
-    };
-    const onListening = () => {
-      frontServer.removeListener("error", onError);
-      resolve();
-    };
-    frontServer.once("error", onError);
-    frontServer.once("listening", onListening);
-    frontServer.listen(opts.port, opts.host ?? "127.0.0.1");
-  });
+  // const frontServer = createPreviewFrontServer(opts.middleware, internalAddress.port);
+  // await new Promise<void>((resolve, reject) => {
+  //   const onError = (err: Error & { code?: string }) => {
+  //     frontServer.removeListener("listening", onListening);
+  //     // The internal server is already listening; if the front fails to bind
+  //     // (e.g. EADDRINUSE during the port-scan retry loop), close it too so we
+  //     // don't leak a listener per attempt.
+  //     internalServer.close(() => reject(err));
+  //   };
+  //   const onListening = () => {
+  //     frontServer.removeListener("error", onError);
+  //     resolve();
+  //   };
+  //   frontServer.once("error", onError);
+  //   frontServer.once("listening", onListening);
+  //   frontServer.listen(opts.port, opts.host ?? "127.0.0.1");
+  // });
 
   return {
     stop: () => {
-      frontServer.close();
+      // frontServer.close();
       internalServer.close();
     },
   };

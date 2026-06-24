@@ -35,10 +35,10 @@ final class FrameCapture {
     private static let idleIntervalMs: UInt64 = 200
 
     private var descriptors: [NSObject] = []
-    private var callbackUUIDs: [ObjectIdentifier: NSUUID] = [:]
+    private var callbackUUIDs: [ObjectIdentifier: UUID] = [:]
     private var ioClient: NSObject?
 
-    func start(deviceUDID: String, onFrame: @escaping (CVPixelBuffer, CMTime) -> Void) throws {
+    func start(deviceUDID: String, onFrame: @escaping @Sendable (CVPixelBuffer, CMTime) -> Void) throws {
         self.onFrame = onFrame
 
         SimFrameworks.load()
@@ -156,36 +156,21 @@ final class FrameCapture {
 
     // MARK: - Frame callbacks via objc_msgSend
 
-    private func registerFrameCallbacks(desc: NSObject) throws {
-        let regSel = NSSelectorFromString("registerScreenCallbacksWithUUID:callbackQueue:frameCallback:surfacesChangedCallback:propertiesChangedCallback:")
+    private func registerFrameCallbacks(desc: AnyObject) throws {
+        let regSel = #selector(FramebufferDescriptor.registerScreenCallbacks)
         guard desc.responds(to: regSel) else {
             throw makeError(8, "Descriptor doesn't support registerScreenCallbacks")
         }
 
-        guard let msgSendPtr = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "objc_msgSend") else {
-            throw makeError(9, "objc_msgSend not found")
-        }
-
-        typealias MsgSendFunc = @convention(c) (
-            AnyObject, Selector, AnyObject, AnyObject, AnyObject, AnyObject, AnyObject
-        ) -> Void
-        let msgSend = unsafeBitCast(msgSendPtr, to: MsgSendFunc.self)
-
-        let uuid = NSUUID()
+        let uuid = UUID()
         callbackUUIDs[ObjectIdentifier(desc)] = uuid
 
-        let frameCallback: @convention(block) () -> Void = { [weak self] in
-            self?.captureQueue.async { self?.captureFrame() }
-        }
-        let surfacesCallback: @convention(block) () -> Void = { [weak self] in
-            self?.captureQueue.async { self?.captureFrame() }
-        }
-        let propsCallback: @convention(block) () -> Void = {}
-
-        msgSend(
-            desc, regSel,
-            uuid, captureQueue as AnyObject,
-            frameCallback as AnyObject, surfacesCallback as AnyObject, propsCallback as AnyObject
+        desc.registerScreenCallbacks(
+            uuid: uuid,
+            callbackQueue: captureQueue,
+            frameCallback: { [weak self] in self?.captureFrame() },
+            surfacesChangedCallback: { [weak self] in self?.captureFrame() },
+            propertiesChangedCallback: {}
         )
     }
 
@@ -307,4 +292,15 @@ final class FrameCapture {
             ($0.value(forKey: "UDID") as? NSUUID)?.uuidString == udid
         })
     }
+}
+
+@objc protocol FramebufferDescriptor {
+    @objc(registerScreenCallbacksWithUUID:callbackQueue:frameCallback:surfacesChangedCallback:propertiesChangedCallback:)
+    func registerScreenCallbacks(
+        uuid: UUID,
+        callbackQueue: DispatchQueue,
+        frameCallback: @convention(block) @escaping () -> Void,
+        surfacesChangedCallback: @convention(block) @escaping () -> Void,
+        propertiesChangedCallback: @convention(block) @escaping () -> Void
+    )
 }
