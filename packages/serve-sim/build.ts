@@ -129,6 +129,7 @@ const mwResult = await Bun.build({
   outdir: distDir,
   external: ["fs", "path", "os", "child_process", "url", "net", "tls", "crypto", "stream", "events", "http", "https", "zlib", "buffer", "module", "ws"],
   define: PREVIEW_DEFINE,
+  sourcemap: "linked",
 });
 if (!mwResult.success) {
   console.error("Middleware build failed:");
@@ -155,6 +156,7 @@ const binJsResult = await Bun.build({
   naming: "serve-sim.js",
   external: ["fs", "path", "os", "child_process", "url", "net", "tls", "crypto", "stream", "events", "http", "https", "zlib", "buffer", "module", "ws"],
   define: PREVIEW_DEFINE,
+  sourcemap: "linked",
 });
 if (!binJsResult.success) {
   console.error("Bin JS build failed:");

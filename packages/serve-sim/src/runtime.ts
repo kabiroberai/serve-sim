@@ -32,8 +32,8 @@ export interface PreviewServer {
 type ConnectMiddleware = (
   req: IncomingMessage,
   res: ServerResponse,
-  next: () => void,
-) => void;
+  next: () => Promise<void>,
+) => Promise<void>;
 
 type PreviewMiddleware = ConnectMiddleware & {
   handleUpgrade?: (req: IncomingMessage, socket: Socket, head: Buffer) => void;
@@ -146,12 +146,29 @@ export async function servePreview(opts: {
    */
   host?: string;
 }): Promise<PreviewServer> {
-  const internalServer = createHttpServer((req, res) => {
-    opts.middleware(req, res, () => {
-      if (!res.headersSent) res.statusCode = 404;
-      res.end("Not found");
-    });
-  });
+  const isBun = !!process.versions.bun
+
+  const internalServer = createHttpServer(
+    {
+      highWaterMark: 1024 * 1024 * 5,
+    },
+    async (req, res) => {
+      try {
+        return await opts.middleware(req, res, async () => {
+          if (!res.headersSent) res.statusCode = 404;
+          res.end("Not found");
+        });
+      } catch (err) {
+        console.error("Middleware error:", err);
+        if (!res.headersSent) {
+          res.statusCode = 500;
+          res.end("Internal Server Error");
+        } else {
+          res.end();
+        }
+      }
+    }
+  );
   // MJPEG streams + SSE log channel are long-lived; clear the default 2-min
   // socket timeout so they don't get torn down mid-stream.
   internalServer.keepAliveTimeout = 0;
@@ -177,7 +194,11 @@ export async function servePreview(opts: {
     };
     internalServer.once("error", onError);
     internalServer.once("listening", onListening);
-    internalServer.listen(0, "127.0.0.1");
+    if (isBun) {
+      internalServer.listen(0, "127.0.0.1");
+    } else {
+      internalServer.listen(opts.port, opts.host ?? "127.0.0.1");
+    }
   });
 
   const internalAddress = internalServer.address();
@@ -186,29 +207,34 @@ export async function servePreview(opts: {
     throw new Error("Failed to bind preview HTTP server");
   }
 
-  const frontServer = createPreviewFrontServer(opts.middleware, internalAddress.port);
-
-  await new Promise<void>((resolve, reject) => {
-    const onError = (err: Error & { code?: string }) => {
-      frontServer.removeListener("listening", onListening);
-      // The internal server is already listening; if the front fails to bind
-      // (e.g. EADDRINUSE during the port-scan retry loop), close it too so we
-      // don't leak a listener per attempt.
-      internalServer.close(() => reject(err));
-    };
-    const onListening = () => {
-      frontServer.removeListener("error", onError);
-      resolve();
-    };
-    frontServer.once("error", onError);
-    frontServer.once("listening", onListening);
-    frontServer.listen(opts.port, opts.host ?? "127.0.0.1");
-  });
+  let maybeFrontServer: NetServer | undefined;
+  if (isBun) {
+    // works around a bug where Bun fails to proxy websockets
+    // https://github.com/oven-sh/bun/issues/14522
+    const frontServer = createPreviewFrontServer(opts.middleware, internalAddress.port);
+    maybeFrontServer = frontServer;
+    await new Promise<void>((resolve, reject) => {
+      const onError = (err: Error & { code?: string }) => {
+        frontServer.removeListener("listening", onListening);
+        // The internal server is already listening; if the front fails to bind
+        // (e.g. EADDRINUSE during the port-scan retry loop), close it too so we
+        // don't leak a listener per attempt.
+        internalServer.close(() => reject(err));
+      };
+      const onListening = () => {
+        frontServer.removeListener("error", onError);
+        resolve();
+      };
+      frontServer.once("error", onError);
+      frontServer.once("listening", onListening);
+      frontServer.listen(opts.port, opts.host ?? "127.0.0.1");
+    });
+  }
 
   return {
     stop: () => {
-      frontServer.close();
-      internalServer.close();
+      internalServer.close()
+      maybeFrontServer?.close()
     },
   };
 }

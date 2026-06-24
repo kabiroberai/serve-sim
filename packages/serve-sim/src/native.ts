@@ -19,53 +19,58 @@ const require = createRequire(import.meta.url);
 // handle is garbage-collected (Swift `deinit`), so there are no explicit
 // destroy/free calls here.
 interface SimHIDHandle {
-  touch(type: TouchType, x: number, y: number, w: number, hh: number, edge: number): void;
-  multiTouch(type: TouchType, x1: number, y1: number, x2: number, y2: number, w: number, hh: number): void;
-  button(button: string): void;
-  buttonHid(page: number, usage: number, phase: ButtonPhase): void;
-  key(type: KeyType, usage: number): void;
-  scroll(dx: number, dy: number, anchorX: number, anchorY: number, w: number, hh: number): void;
-  digitalCrown(delta: number): void;
-  orientation(orientation: number): boolean;
-  memoryWarning(): void;
-  softwareKeyboard(): void;
-  caDebug(name: string, enabled: boolean): boolean;
+  touch(type: TouchType, x: number, y: number, w: number, hh: number, edge: number): Promise<void>;
+  multiTouch(type: TouchType, x1: number, y1: number, x2: number, y2: number, w: number, hh: number): Promise<void>;
+  button(button: string): Promise<void>;
+  buttonHid(page: number, usage: number, phase: ButtonPhase): Promise<void>;
+  key(type: KeyType, usage: number): Promise<void>;
+  scroll(dx: number, dy: number, anchorX: number, anchorY: number, w: number, hh: number): Promise<void>;
+  digitalCrown(delta: number): Promise<void>;
+  orientation(orientation: number): Promise<boolean>;
+  memoryWarning(): Promise<void>;
+  softwareKeyboard(): Promise<void>;
+  caDebug(name: string, enabled: boolean): Promise<boolean>;
 }
 
 interface SimCaptureHandle {
   start(): void;
-  setAvccActive(active: boolean): void;
-  requestKeyframe(): void;
-  screenSize(): { width: number; height: number };
   stop(): void;
+  subscribe(codec: number, onFrame: RawFrameCallback): Promise<() => void>;
 }
 
 interface NativeAddon {
   SimHID: new (udid: string) => SimHIDHandle;
-  SimCapture: new (udid: string, onFrame: RawFrameCallback) => SimCaptureHandle;
+  SimCapture: new (udid: string) => SimCaptureHandle;
   axDescribe(udid: string): Promise<string>;
   axFrontmost(udid: string): Promise<string>;
 }
 
 // (codec, data, width, height, flags) — codec 0=MJPEG 1=AVCC; flags bit0=desc bit1=keyframe.
-type RawFrameCallback = (codec: number, data: Buffer, width: number, height: number, flags: number) => void;
+type RawFrameCallback = (
+  data: Uint8Array,
+  width: number,
+  height: number,
+  flags: number,
+) => Promise<void>;
 
+const CODEC_MJPEG = 0;
 const CODEC_AVCC = 1;
 const FLAG_DESCRIPTION = 1 << 0;
 const FLAG_KEYFRAME = 1 << 1;
 
-export interface NativeFrame {
-  /** `mjpeg` = a full JPEG; `avcc` = a length-prefixed AVCC envelope chunk. */
-  codec: "mjpeg" | "avcc";
-  /** Encoded bytes, ready to write to the stream wire. */
-  data: Buffer;
+export type MjpegFrame = {
+  data: Uint8Array;
   width: number;
   height: number;
-  /** AVCC only: this chunk is the avcC parameter-set blob (decoder config). */
+};
+
+export type AvccFrame = {
+  data: Uint8Array;
+  width: number;
+  height: number;
   isDescription: boolean;
-  /** AVCC only: this chunk is an IDR keyframe (a decoder can start here). */
   isKeyframe: boolean;
-}
+};
 
 export type TouchType = "begin" | "move" | "end";
 export type KeyType = "down" | "up";
@@ -123,81 +128,72 @@ export class NativeHid {
   // mid-gesture, the guest is left with a stuck finger that wedges input until
   // the sim reboots. The spawned helper used to absorb this in its own process;
   // `guard` restores that isolation by swallowing malformed-input errors.
-  private guard<T>(op: string, fn: () => T, fallback: T): T {
+  private async guard<T>(op: string, fn: () => PromiseLike<T>, fallback: T): Promise<T> {
     try {
-      return fn();
+      return await fn();
     } catch (err) {
       console.error(`[hid] ${op} ignored bad input:`, err instanceof Error ? err.message : err);
       return fallback;
     }
   }
 
-  touch(type: TouchType, x: number, y: number, w: number, h: number, edge = 0): void {
-    this.guard("touch", () => this.handle.touch(type, x, y, w, h, edge), undefined);
+  touch(type: TouchType, x: number, y: number, w: number, h: number, edge = 0): Promise<void> {
+    return this.guard("touch", () => this.handle.touch(type, x, y, w, h, edge), undefined);
   }
 
-  multiTouch(type: TouchType, x1: number, y1: number, x2: number, y2: number, w: number, h: number): void {
-    this.guard("multiTouch", () => this.handle.multiTouch(type, x1, y1, x2, y2, w, h), undefined);
+  multiTouch(type: TouchType, x1: number, y1: number, x2: number, y2: number, w: number, h: number): Promise<void> {
+    return this.guard("multiTouch", () => this.handle.multiTouch(type, x1, y1, x2, y2, w, h), undefined);
   }
 
-  button(button: string): void {
-    this.guard("button", () => this.handle.button(button), undefined);
+  button(button: string): Promise<void> {
+    return this.guard("button", () => this.handle.button(button), undefined);
   }
 
-  buttonHid(page: number, usage: number, phase: ButtonPhase = "press"): void {
-    this.guard("buttonHid", () => this.handle.buttonHid(page, usage, phase), undefined);
+  buttonHid(page: number, usage: number, phase: ButtonPhase = "press"): Promise<void> {
+    return this.guard("buttonHid", () => this.handle.buttonHid(page, usage, phase), undefined);
   }
 
-  key(type: KeyType, usage: number): void {
-    this.guard("key", () => this.handle.key(type, usage), undefined);
+  key(type: KeyType, usage: number): Promise<void> {
+    return this.guard("key", () => this.handle.key(type, usage), undefined);
   }
 
   /** anchorX/anchorY default to screen center when omitted. */
-  scroll(dx: number, dy: number, w: number, h: number, anchorX?: number, anchorY?: number): void {
-    this.guard("scroll", () => this.handle.scroll(dx, dy, anchorX ?? NaN, anchorY ?? NaN, w, h), undefined);
+  scroll(dx: number, dy: number, w: number, h: number, anchorX?: number, anchorY?: number): Promise<void> {
+    return this.guard("scroll", () => this.handle.scroll(dx, dy, anchorX ?? NaN, anchorY ?? NaN, w, h), undefined);
   }
 
-  digitalCrown(delta: number): void {
-    this.guard("digitalCrown", () => this.handle.digitalCrown(delta), undefined);
+  digitalCrown(delta: number): Promise<void> {
+    return this.guard("digitalCrown", () => this.handle.digitalCrown(delta), undefined);
   }
 
-  orientation(orientation: number): boolean {
+  orientation(orientation: number): Promise<boolean> {
     return this.guard("orientation", () => this.handle.orientation(orientation), false);
   }
 
-  memoryWarning(): void {
-    this.guard("memoryWarning", () => this.handle.memoryWarning(), undefined);
+  memoryWarning(): Promise<void> {
+    return this.guard("memoryWarning", () => this.handle.memoryWarning(), undefined);
   }
 
-  softwareKeyboard(): void {
-    this.guard("softwareKeyboard", () => this.handle.softwareKeyboard(), undefined);
+  softwareKeyboard(): Promise<void> {
+    return this.guard("softwareKeyboard", () => this.handle.softwareKeyboard(), undefined);
   }
 
-  caDebug(name: string, enabled: boolean): boolean {
+  caDebug(name: string, enabled: boolean): Promise<boolean> {
     return this.guard("caDebug", () => this.handle.caDebug(name, enabled), false);
   }
 }
 
 /**
  * In-process frame capture + encode for one simulator. Replaces the spawned
- * helper's capture pipeline: MJPEG frames are always produced; H.264/AVCC runs
- * only while `setAvccActive(true)`. Encoded frames arrive via the `onFrame`
- * callback on the JS thread (marshalled from the native encode thread).
+ * helper's capture pipeline. MJPEG and H.264/AVCC frames are produced while
+ * callers hold codec-specific subscriptions; encoded frames arrive on the JS
+ * thread after being marshalled from the native encode thread.
  */
 export class NativeCapture {
   private readonly handle: SimCaptureHandle;
 
-  constructor(udid: string, onFrame: (frame: NativeFrame) => void) {
-    this.handle = new (load().SimCapture)(udid, (codec, data, width, height, flags) => {
-      onFrame({
-        codec: codec === CODEC_AVCC ? "avcc" : "mjpeg",
-        data,
-        width,
-        height,
-        isDescription: (flags & FLAG_DESCRIPTION) !== 0,
-        isKeyframe: (flags & FLAG_KEYFRAME) !== 0,
-      });
-    });
+  constructor(udid: string) {
+    this.handle = new (load().SimCapture)(udid);
   }
 
   /** Begin capturing. Throws if the device isn't booted. */
@@ -205,18 +201,22 @@ export class NativeCapture {
     this.handle.start();
   }
 
-  /** Enable/disable H.264 encoding (forces an IDR on the next frame when enabled). */
-  setAvccActive(active: boolean): void {
-    this.handle.setAvccActive(active);
+  subscribeMjpeg(onFrame: (frame: MjpegFrame) => Promise<void>): Promise<() => void> {
+    return this.handle.subscribe(CODEC_MJPEG, (data, width, height, _flags) => {
+      return onFrame({ data, width, height });
+    });
   }
 
-  /** Force the next H.264 frame to a keyframe (e.g. when a new AVCC viewer joins). */
-  requestKeyframe(): void {
-    this.handle.requestKeyframe();
-  }
-
-  screenSize(): { width: number; height: number } {
-    return this.handle.screenSize();
+  subscribeAvcc(onFrame: (frame: AvccFrame) => Promise<void>): Promise<() => void> {
+    return this.handle.subscribe(CODEC_AVCC, (data, width, height, flags) => {
+      return onFrame({
+        data,
+        width,
+        height,
+        isDescription: (flags & FLAG_DESCRIPTION) !== 0,
+        isKeyframe: (flags & FLAG_KEYFRAME) !== 0,
+      });
+    });
   }
 
   /** Halt frame production. Full teardown happens when this object is GC'd. */

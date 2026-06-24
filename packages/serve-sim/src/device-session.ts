@@ -15,7 +15,14 @@
  * original byte-for-byte so the existing browser client is unchanged.
  */
 import type { IncomingMessage, ServerResponse } from "http";
-import { NativeCapture, NativeHid, Orientation, axDescribeAsync, axFrontmostAsync, type NativeFrame } from "./native";
+import {
+  NativeCapture,
+  NativeHid,
+  Orientation,
+  axDescribeAsync,
+  axFrontmostAsync,
+  type MjpegFrame,
+} from "./native";
 
 /**
  * Minimal WebSocket surface the HID input channel needs. Satisfied by both the
@@ -36,10 +43,6 @@ const CORS = {
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
-// Don't let a stalled viewer's socket buffer grow without bound — drop frames
-// for a client that's this far behind rather than balloon memory.
-const MAX_CLIENT_BACKLOG = 8 * 1024 * 1024;
-
 // AVCC seed tag (StreamFormat.AVCCEnvelope.seedTag). description/keyframe/delta
 // envelopes are framed natively; only the on-connect JPEG seed is built here.
 const AVCC_SEED_TAG = 0x04;
@@ -53,11 +56,11 @@ function mjpegHeader(jpegLength: number): Buffer {
   return Buffer.from(`--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${jpegLength}\r\n\r\n`, "ascii");
 }
 
-function avccSeed(jpeg: Buffer): Buffer {
+function avccSeed(jpeg: Uint8Array): Buffer {
   const out = Buffer.allocUnsafe(5 + jpeg.length);
   out.writeUInt32BE(jpeg.length + 1, 0); // length covers the tag byte + payload
   out[4] = AVCC_SEED_TAG;
-  jpeg.copy(out, 5);
+  out.set(jpeg, 5);
   return out;
 }
 
@@ -68,92 +71,97 @@ const ORIENTATION_BY_NAME: Record<string, number> = {
   landscape_right: Orientation.landscapeRight,
 };
 
+function waitForDrain(res: ServerResponse): Promise<void> {
+  if (res.writableEnded || res.destroyed || !res.writableNeedDrain) return Promise.resolve();
+
+  return new Promise((resolve) => {
+    const done = () => {
+      cleanup();
+      resolve();
+    };
+    const cleanup = () => {
+      res.off("drain", done);
+      res.off("close", done);
+      res.off("error", done);
+    };
+    res.once("drain", done);
+    res.once("close", done);
+    res.once("error", done);
+  });
+}
+
 export class DeviceSession {
   private readonly capture: NativeCapture;
   private readonly hid: NativeHid;
-  private started = false;
+  private unsubscribeMjpeg?: () => void;
+  private phase: "unstarted" | "running" | "stopped" = "unstarted";
 
   private width = 0;
   private height = 0;
   private orientation = "portrait";
 
-  private latestJpeg: Buffer | null = null;
-  private cachedAvccDescription: Buffer | null = null;
-  private readonly mjpegClients = new Set<ServerResponse>();
-  private readonly avccClients = new Set<ServerResponse>();
+  private latestJpegBuffer: Buffer | null = null;
+  private latestJpegLength = 0;
   private readonly hidSockets = new Set<HidSocket>();
 
   constructor(public readonly udid: string) {
     this.hid = new NativeHid(udid);
-    this.capture = new NativeCapture(udid, (f) => this.onFrame(f));
+    this.capture = new NativeCapture(udid);
   }
 
   /** Begin capture. Throws if the device isn't booted. Idempotent. */
   start(): void {
-    if (this.started) return;
+    if (this.phase !== "unstarted") return;
     this.capture.start();
-    this.started = true;
+    void (async () => {
+      const unsubscribe = await this.capture.subscribeMjpeg((frame) => this.onSharedMjpegFrame(frame));
+      if (this.phase === "running") { // only if someone hasn't already stopped the capture
+        this.unsubscribeMjpeg = unsubscribe;
+      } else {
+        unsubscribe();
+      }
+    })();
+    this.phase = "running";
   }
 
   close(): void {
-    for (const res of this.mjpegClients) res.end();
-    for (const res of this.avccClients) res.end();
+    if (this.phase !== "running") return;
     for (const ws of this.hidSockets) ws.close();
-    this.mjpegClients.clear();
-    this.avccClients.clear();
+    this.unsubscribeMjpeg?.();
     this.hidSockets.clear();
     this.capture.stop();
+    this.phase = "stopped";
   }
 
-  // ── Frame fan-out ────────────────────────────────────────────────────────
+  // ── Frame handling ───────────────────────────────────────────────────────
 
-  private onFrame(f: NativeFrame): void {
-    if (f.codec === "mjpeg") {
-      this.latestJpeg = f.data;
-      if (f.width !== this.width || f.height !== this.height) {
-        this.width = f.width;
-        this.height = f.height;
-        this.broadcastConfig();
-      }
-      if (this.mjpegClients.size === 0) return;
-      // Build only the small header once; the JPEG itself is written by
-      // reference to every client, avoiding a full-frame copy per frame.
-      const header = mjpegHeader(f.data.length);
-      for (const res of this.mjpegClients) this.writeMjpegFrame(res, header, f.data);
-    } else {
-      if (f.isDescription) this.cachedAvccDescription = f.data;
-      for (const res of this.avccClients) this.writeAvccFrame(res, f.data);
+  private async onSharedMjpegFrame(frame: MjpegFrame): Promise<void> {
+    const { width, height, data: jpeg } = frame;
+
+    if (width !== this.width || height !== this.height) {
+      this.width = width;
+      this.height = height;
+      this.broadcastConfig();
     }
+
+    if (!this.latestJpegBuffer || this.latestJpegBuffer.length < jpeg.length) {
+      const currentCapacity = this.latestJpegBuffer?.length ?? 0;
+      this.latestJpegBuffer = Buffer.allocUnsafe(Math.max(jpeg.length, currentCapacity * 2));
+    }
+    this.latestJpegBuffer.set(jpeg, 0);
+    this.latestJpegLength = jpeg.length;
+  }
+
+  private latestJpeg(): Buffer | null {
+    if (!this.latestJpegBuffer) return null;
+    return this.latestJpegBuffer.subarray(0, this.latestJpegLength);
   }
 
   /** Write a multipart JPEG part (header + shared frame + boundary) without copying the JPEG. */
-  private writeMjpegFrame(res: ServerResponse, header: Buffer, jpeg: Buffer): void {
-    if (res.writableEnded || res.writableLength > MAX_CLIENT_BACKLOG) return;
-    res.cork();
-    res.write(header);
+  private writeMjpegFrame(res: ServerResponse, jpeg: Uint8Array): void {
+    res.write(mjpegHeader(jpeg.length));
     res.write(jpeg);
     res.write(MJPEG_TRAILER);
-    res.uncork();
-  }
-
-  /**
-   * Write an AVCC chunk. AVCC is inter-frame H.264, so dropping a chunk corrupts
-   * the decoder until the next IDR (visible tearing). Rather than drop, evict a
-   * client whose socket is backed up: it reconnects via handleAvcc and is
-   * re-seeded with the cached description + a fresh keyframe, yielding a clean
-   * stream instead of a corrupted one.
-   */
-  private writeAvccFrame(res: ServerResponse, chunk: Buffer): void {
-    if (res.writableEnded) {
-      this.avccClients.delete(res);
-      return;
-    }
-    if (res.writableLength > MAX_CLIENT_BACKLOG) {
-      this.avccClients.delete(res);
-      res.end();
-      return;
-    }
-    res.write(chunk);
   }
 
   // ── HTTP handlers ────────────────────────────────────────────────────────
@@ -166,11 +174,18 @@ export class DeviceSession {
       Connection: "keep-alive",
       ...CORS,
     });
-    this.mjpegClients.add(res);
-    if (this.latestJpeg) this.writeMjpegFrame(res, mjpegHeader(this.latestJpeg.length), this.latestJpeg); // paint immediately
-    const drop = () => this.mjpegClients.delete(res);
-    res.on("close", drop);
-    res.on("error", drop);
+
+    void (async () => {
+      const latestJpeg = this.latestJpeg();
+      if (latestJpeg) this.writeMjpegFrame(res, latestJpeg); // paint immediately
+      const unsubscribe = await this.capture.subscribeMjpeg(async (frame) => {
+        await waitForDrain(res);
+        this.writeMjpegFrame(res, frame.data);
+      });
+      if (res.writableEnded) unsubscribe();
+      res.on("close", unsubscribe);
+      res.on("error", unsubscribe);
+    })();
   }
 
   handleAvcc(_req: IncomingMessage, res: ServerResponse): void {
@@ -180,19 +195,21 @@ export class DeviceSession {
       Connection: "keep-alive",
       ...CORS,
     });
-    this.avccClients.add(res);
-    this.capture.setAvccActive(true);
-    // Seed with the current screen, replay the cached decoder config, then force
-    // an IDR so the freshly-configured decoder has a keyframe to start from.
-    if (this.latestJpeg) res.write(avccSeed(this.latestJpeg));
-    if (this.cachedAvccDescription) res.write(this.cachedAvccDescription);
-    this.capture.requestKeyframe();
-    const drop = () => {
-      this.avccClients.delete(res);
-      if (this.avccClients.size === 0) this.capture.setAvccActive(false);
-    };
-    res.on("close", drop);
-    res.on("error", drop);
+
+    void (async () => {
+      // Seed with the current screen; the per-client native AVCC subscription
+      // starts with its own decoder config and keyframe.
+      const latestJpeg = this.latestJpeg();
+      if (latestJpeg) res.write(avccSeed(latestJpeg));
+
+      const unsubscribe = await this.capture.subscribeAvcc(async (frame) => {
+        await waitForDrain(res);
+        res.write(frame.data);
+      });
+      if (res.writableEnded) unsubscribe();
+      res.on("close", unsubscribe);
+      res.on("error", unsubscribe);
+    })();
   }
 
   handleConfig(_req: IncomingMessage, res: ServerResponse): void {
@@ -237,7 +254,7 @@ export class DeviceSession {
     ws.on("error", () => this.hidSockets.delete(ws));
   }
 
-  private handleHidMessage(data: Buffer): void {
+  private async handleHidMessage(data: Buffer): Promise<void> {
     if (data.length < 1) return;
     const tag = data[0];
     const body = data.length > 1 ? data.subarray(1) : null;
@@ -282,7 +299,7 @@ export class DeviceSession {
         const m = json<{ orientation: string }>();
         if (!m) break;
         const value = ORIENTATION_BY_NAME[m.orientation];
-        if (value != null && this.hid.orientation(value)) {
+        if (value != null && await this.hid.orientation(value)) {
           if (m.orientation !== this.orientation) {
             this.orientation = m.orientation;
             this.broadcastConfig();

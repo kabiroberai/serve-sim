@@ -27,60 +27,60 @@ private func u32(_ v: Int) -> UInt32 {
     @NodeConstructor init(_ udid: String) throws {
         self.udid = udid
         injector = HIDInjector()
-        try injector.setup(deviceUDID: udid)
+        Task { try await injector.setup(deviceUDID: udid) }
     }
 
     @NodeMethod func touch(_ type: String, _ x: Double, _ y: Double,
-                           _ w: Int, _ h: Int, _ edge: Int) {
-        injector.sendTouch(type: type, x: x, y: y,
+                           _ w: Int, _ h: Int, _ edge: Int) async {
+        await injector.sendTouch(type: type, x: x, y: y,
                            screenWidth: w, screenHeight: h, edge: u32(edge))
     }
 
     @NodeMethod func multiTouch(_ type: String, _ x1: Double, _ y1: Double,
-                                _ x2: Double, _ y2: Double, _ w: Int, _ h: Int) {
-        injector.sendMultiTouch(type: type, x1: x1, y1: y1, x2: x2, y2: y2,
+                                _ x2: Double, _ y2: Double, _ w: Int, _ h: Int) async {
+        await injector.sendMultiTouch(type: type, x1: x1, y1: y1, x2: x2, y2: y2,
                                 screenWidth: w, screenHeight: h)
     }
 
-    @NodeMethod func button(_ button: String) {
-        injector.sendButton(button: button, deviceUDID: udid)
+    @NodeMethod func button(_ button: String) async {
+        await injector.sendButton(button: button, deviceUDID: udid)
     }
 
-    @NodeMethod func buttonHid(_ page: Int, _ usage: Int, _ phase: String) {
-        injector.sendButtonHID(page: u32(page), usage: u32(usage), phase: phase)
+    @NodeMethod func buttonHid(_ page: Int, _ usage: Int, _ phase: String) async {
+        await injector.sendButtonHID(page: u32(page), usage: u32(usage), phase: phase)
     }
 
-    @NodeMethod func key(_ type: String, _ usage: Int) {
-        injector.sendKey(type: type, usage: u32(usage))
+    @NodeMethod func key(_ type: String, _ usage: Int) async {
+        await injector.sendKey(type: type, usage: u32(usage))
     }
 
     /// NaN anchorX/anchorY mean "center" (the Swift API's nil).
     @NodeMethod func scroll(_ dx: Double, _ dy: Double,
-                            _ anchorX: Double, _ anchorY: Double, _ w: Int, _ h: Int) {
-        injector.sendScroll(dx: dx, dy: dy,
+                            _ anchorX: Double, _ anchorY: Double, _ w: Int, _ h: Int) async {
+        await injector.sendScroll(dx: dx, dy: dy,
                             anchorX: anchorX.isNaN ? nil : anchorX,
                             anchorY: anchorY.isNaN ? nil : anchorY,
                             screenWidth: w, screenHeight: h)
     }
 
-    @NodeMethod func digitalCrown(_ delta: Double) {
-        injector.sendDigitalCrown(delta: delta)
+    @NodeMethod func digitalCrown(_ delta: Double) async {
+        await injector.sendDigitalCrown(delta: delta)
     }
 
-    @NodeMethod func orientation(_ orientation: Int) -> Bool {
-        injector.sendOrientation(orientation: u32(orientation))
+    @NodeMethod func orientation(_ orientation: Int) async -> Bool {
+        await injector.sendOrientation(orientation: u32(orientation))
     }
 
-    @NodeMethod func memoryWarning() {
-        injector.simulateMemoryWarning()
+    @NodeMethod func memoryWarning() async {
+        await injector.simulateMemoryWarning()
     }
 
-    @NodeMethod func softwareKeyboard() {
-        injector.toggleSoftwareKeyboard()
+    @NodeMethod func softwareKeyboard() async {
+        await injector.toggleSoftwareKeyboard()
     }
 
-    @NodeMethod func caDebug(_ name: String, _ enabled: Bool) -> Bool {
-        injector.setCADebugOption(name: name, enabled: enabled)
+    @NodeMethod func caDebug(_ name: String, _ enabled: Bool) async -> Bool {
+        await injector.setCADebugOption(name: name, enabled: enabled)
     }
 }
 
@@ -93,64 +93,94 @@ private func u32(_ v: Int) -> UInt32 {
 /// (codec, Buffer, width, height, flags).
 @NodeClass @NodeActor final class SimCapture {
     private let engine: CaptureEngine
-    private let onFrame: NodeFunction
     private let queue: NodeAsyncQueue
 
-    @NodeConstructor init(_ udid: String, _ onFrame: NodeFunction) throws {
+    @NodeConstructor init(_ udid: String) throws {
         // unref'd by NodeAsyncQueue's init, so the frame pipeline alone won't
         // keep the event loop alive. Bounded queue + blocking AVCC preserves
         // inter-frame ordering; MJPEG is nonblocking and drops under backpressure.
         let queue = try NodeAsyncQueue(label: "simCapture", maxQueueSize: 16)
-        self.onFrame = onFrame
         self.queue = queue
+        self.engine = CaptureEngine(deviceUDID: udid)
+    }
 
-        // Capture the locals (not self) so the closure can be built before the
-        // engine property is initialized, and so it holds no strong ref to self.
-        engine = CaptureEngine(deviceUDID: udid) { codec, data, w, h, flags in
-            // Runs on a native encode thread. AVCC is inter-frame H.264 — dropping
-            // a delta corrupts the decoder until the next IDR — so deliver it
-            // blocking; MJPEG is stateless and safe to drop. We copy the bytes
-            // into a managed Buffer (NodeBuffer(copying:)) on the JS thread:
-            // external buffers crash Bun's GC under frame churn, and the
-            // production CLI is a bun-compiled binary.
-            let blocking = codec == CaptureEngine.codecAVCC
-            try? queue.run(blocking: blocking) {
-                _ = try? onFrame.call([
-                    Int(codec), try NodeBuffer(copying: data),
-                    Int(w), Int(h), Int(flags),
-                ])
+    // returns a function that can be called to unsubscribe
+    @NodeMethod func subscribe(
+        codec: Int,
+        onFrame: NodeFunction
+    ) async throws -> NodeFunction {
+        let codecMJPEG: Int = 0
+        let codecAVCC: Int = 1
+
+        var buffer = try CaptureBuffer(initialCapacity: 1024 * 1024)
+        let unsubscribe: @Sendable () async -> Void
+        switch codec {
+        case codecMJPEG:
+            unsubscribe = await engine.addMJPEGConsumer { [self] dimensions, data in
+                try? await queue.run {
+                    let array = try buffer.setData(data)
+                    _ = try? await onFrame.call([
+                        array,
+                        Int(dimensions.width), Int(dimensions.height),
+                        0,
+                    ]).as(NodePromise.self)?.value
+                }
             }
+        case codecAVCC:
+            unsubscribe = await engine.addAVCCConsumer { [self] dimensions, data, flags in
+                try? await queue.run {
+                    let array = try buffer.setData(data)
+                    _ = try? await onFrame.call([
+                        array,
+                        Int(dimensions.width), Int(dimensions.height),
+                        Int(flags),
+                    ]).as(NodePromise.self)?.value
+                }
+            }
+        default:
+            throw Errors.invalidCodec
         }
+        return try NodeFunction { await unsubscribe() }
     }
 
-    @NodeMethod func start() throws {
-        try engine.start()
+    @NodeMethod func start() async throws {
+        try await engine.start()
     }
 
-    @NodeMethod func setAvccActive(_ active: Bool) {
-        engine.setAvccActive(active)
-    }
-
-    @NodeMethod func requestKeyframe() {
-        engine.requestKeyframe()
-    }
-
-    @NodeMethod func screenSize() -> [String: any NodePropertyConvertible] {
-        let (w, h) = engine.screenSize()
-        return ["width": w, "height": h]
-    }
-
-    @NodeMethod func stop() {
-        engine.stop()
+    @NodeMethod func stop() async {
+        await engine.stop()
     }
 
     deinit {
-        // Abort the queue first so any encode thread blocked in `run` unblocks
-        // (its call returns .closing and the frame is dropped); then drain the
-        // encoders so nothing can fire afterwards. The tsfn is released when
-        // `queue` deinitializes after this body.
-        try? queue.close()
-        engine.stop()
+        Task { [engine] in await engine.stop() }
+    }
+
+    enum Errors: Error {
+        case invalidCodec
+    }
+}
+
+@NodeActor private struct CaptureBuffer {
+    private var buffer: NodeArrayBuffer
+
+    init(initialCapacity: Int) throws {
+        buffer = try NodeArrayBuffer(capacity: initialCapacity)
+    }
+
+    mutating func setData(_ data: Data) throws -> NodeTypedArray<UInt8> {
+        let hadSpace = try buffer.withUnsafeMutableBytes { buffer in
+            guard data.count <= buffer.count else { return false }
+            _ = data.copyBytes(to: buffer)
+            return true
+        }
+
+        if !hadSpace {
+            // allocate a new buffer with sufficient capacity. old buffer will be GC'd.
+            buffer = try NodeArrayBuffer(capacity: data.count)
+            _ = try buffer.withUnsafeMutableBytes { data.copyBytes(to: $0) }
+        }
+
+        return try NodeTypedArray<UInt8>(for: buffer, count: data.count)
     }
 }
 
