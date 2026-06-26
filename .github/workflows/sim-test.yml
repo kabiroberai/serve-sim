@@ -84,7 +84,7 @@ jobs:
         env:
           UDID: ${{ steps.boot-sim.outputs.udid }}
         run: |
-          run_tests() { bun test packages/serve-sim/src/__tests__/; }
+          run_tests() { bun test --max-concurrency=1 packages/serve-sim/src/__tests__/; }
           if run_tests; then exit 0; fi
           # The sim-backed e2e tests share one simulator; a wedge from one test
           # (stuck finger, native crash) shows up as hook timeouts / ECONNRESET /

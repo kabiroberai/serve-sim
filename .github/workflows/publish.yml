@@ -121,7 +121,7 @@ jobs:
           # ConnectionRefused / "server not alive" failures in unrelated later
           # tests. Reboot for a clean slate and retry once — a transient wedge
           # clears, a genuine regression reproduces on the second run.
-          run_tests() { bun test packages/serve-sim/src/__tests__/; }
+          run_tests() { bun test --max-concurrency=1 packages/serve-sim/src/__tests__/; }
           if run_tests; then exit 0; fi
           echo "::warning title=sim e2e retry::test run failed; rebooting $UDID and retrying once"
           xcrun simctl shutdown "$UDID" 2>/dev/null || true
