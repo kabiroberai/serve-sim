@@ -31,7 +31,7 @@ const platformOk = process.platform === "darwin";
 const shouldRun = platformOk && helperReady();
 
 interface ShmHandle {
-  ptr: number;
+  ptr: unknown;
   buffer: ArrayBuffer;
   fd: number;
   size: number;
@@ -101,11 +101,12 @@ async function openExistingShm(name: string): Promise<ShmHandle | null> {
     return null;
   }
   const buffer = sys.toArrayBuffer(ptr, 0, size);
-  return { ptr: 0, buffer, fd, size };
+  return { ptr, buffer, fd, size };
 }
 
 async function closeShm(handle: ShmHandle): Promise<void> {
   const sys = await loadFfi();
+  sys.munmap(handle.ptr, BigInt(handle.size));
   sys.close(handle.fd);
 }
 
