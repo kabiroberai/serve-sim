@@ -17,6 +17,10 @@ import {
 } from "./orientation.js";
 import { digitalCrownDeltaFromWheel } from "./digitalCrown.js";
 import { wheelDeltaToPixels } from "./scroll-wheel.js";
+import {
+  resolveScreenConfigUpdate,
+  type ScreenConfigSource,
+} from "./screen-config-state.js";
 import { useAvccStream } from "./use-avcc-stream.js";
 import { isAvccSupported } from "../avcc-codec.js";
 
@@ -188,24 +192,15 @@ export function SimulatorView({
     setScreenSize(null);
   }, [url]);
 
-  const updateScreenConfig = useCallback((config: StreamConfig | null | undefined) => {
-    if (!config || config.width <= 0 || config.height <= 0) return;
-    const prev = screenSizeRef.current;
-    const next =
-      config.orientation === undefined && prev?.orientation
-        ? { ...config, orientation: prev.orientation }
-        : config;
-    if (
-      prev &&
-      prev.width === next.width &&
-      prev.height === next.height &&
-      prev.orientation === next.orientation
-    ) {
-      return;
-    }
-    screenSizeRef.current = next;
-    setScreenSize(next);
-    onScreenConfigChangeRef.current?.(next);
+  const updateScreenConfig = useCallback((
+    config: StreamConfig | null | undefined,
+    source: ScreenConfigSource = "reported",
+  ) => {
+    const update = resolveScreenConfigUpdate(screenSizeRef.current, config, source);
+    if (!update) return;
+    screenSizeRef.current = update.config;
+    setScreenSize(update.config);
+    if (update.notifyParent) onScreenConfigChangeRef.current?.(update.config);
   }, []);
 
   // Notify parent when streaming state changes
@@ -218,7 +213,7 @@ export function SimulatorView({
   // In relay mode, use streamConfig for screen size
   useEffect(() => {
     if (relayMode && streamConfig) {
-      updateScreenConfig(streamConfig);
+      updateScreenConfig(streamConfig, "external");
     }
   }, [relayMode, streamConfig, updateScreenConfig]);
 
